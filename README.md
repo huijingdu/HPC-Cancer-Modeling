@@ -57,3 +57,20 @@ HPC-Cancer-Modeling/
 │   ├── makefile        # Build configuration for GCC and OpenCL
 │   └── cpu.submit      # HPC submission scripts
 └── Skin.pdf            # Reference paper for the modeling framework
+```
+
+---
+
+## Computational Bottlenecks & Optimization Strategies
+
+The current implementation has two primary bottlenecks that limit the scale and speed of the cancer simulations. Addressing these is essential for reaching the target of 10 million level cell simulations.
+
+### 1. Movement Performance: $O(n^2)$ to $O(n)$
+The current pairwise interaction calculation leads to a computational complexity of $O(n^2)$, which becomes prohibitive as the cell count increases.
+
+**Proposed Solution:** Implement a **Verlet Grid (Cell Linked List)** method. By partitioning the 3D spatial domain into a grid, interaction forces are only calculated for cells within the same or neighboring grid cells, reducing complexity to $O(n)$.
+
+### 2. Division Performance: CPU-GPU Synchronization
+Cell division is currently a serial process executed on the CPU due to the complexity of memory reallocation for new cellular elements.
+
+**Proposed Solution:** Maintain a "Pre-allocated Memory Pool" on the GPU and implement synchronization barriers. By adding synchronization before and after the division function, we can safely update the population count and coordinates without full memory re-initialization. This is particularly critical for modeling aggressive tumor growth where high division rates otherwise create a significant CPU-GPU data transfer bottleneck.
