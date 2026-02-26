@@ -23,7 +23,7 @@ The current demo version focuses on cell motility driven by interaction forces. 
 ## HPC Implementation
 
 ### Prerequisites
-The environment must be configured with the appropriate compiler and OpenCL drivers. On the **Swan** cluster, load the following modules:
+The environment must be configured with the appropriate compiler and OpenCL drivers. On the Swan cluster, load the following modules:
 
 ```bash
 module load compiler/gcc/9 cuda/12.2
