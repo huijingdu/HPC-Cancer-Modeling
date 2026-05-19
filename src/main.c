@@ -319,32 +319,33 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     cl_uint ret_num_devices;
     cl_uint ret_num_platforms;
 
-    // get all platforms
-    platform_id = (cl_platform_id*) malloc(sizeof(cl_platform_id) * 2);
-    clGetPlatformIDs(2, platform_id, NULL);
+    cl_platform_id cpPlatform = NULL; // OpenCL platform
+    cl_device_id device_id = NULL; // OpenCL device
 
-
-    cl_platform_id cpPlatform;        // OpenCL platform
-    cl_uint platformCount;
-    // Bind to platform
-    err = clGetPlatformIDs(1, &cpPlatform, &platformCount);
-    printf("# of Platform = %d\n", platformCount);
-    printf("err = %d\n", err);
+    cl_uint nplat = 0;
+    err = clGetPlatformIDs(0, NULL, &nplat);
     assert(err == CL_SUCCESS);
+    printf("# of Platforms = %u\n", nplat);
 
-    cl_device_id device_id;           // device ID
-    // Get ID for the device
-    err = clGetDeviceIDs(cpPlatform, CL_DEVICE_TYPE_CPU, 1, &device_id, NULL);
-    printf("err = %d\n", err);
-    assert(err == CL_SUCCESS);
+    cl_platform_id *plats = malloc(sizeof(cl_platform_id) * nplat);
+    clGetPlatformIDs(nplat, plats, NULL);
 
-#if 1
-    //err = clGetDeviceIDs( platform_id[0], CL_DEVICE_TYPE_GPU, 1,
-    //        &device, &ret_num_devices);
-#else
-    err = clGetDeviceIDs( platform_id[1], CL_DEVICE_TYPE_GPU, 1,
-            &device, &ret_num_devices);
-#endif
+    const cl_device_type wanted = CL_DEVICE_TYPE_GPU; // The type of requested device
+
+    int found = 0;
+    for (cl_uint i = 0; i < nplat && !found; ++i) {
+        char pname[128] = {0};
+        clGetPlatformInfo(plats[i], CL_PLATFORM_NAME, sizeof(pname), pname, NULL);
+        printf("Platform %u: %s\n", i, pname);
+
+        if (clGetDeviceIDs(plats[i], wanted, 1, &device_id, NULL) == CL_SUCCESS) {
+            cpPlatform = plats[i];
+            found = 1;
+        }
+    }
+    free(plats);
+    assert(found);
+
     printf("err = %d\n", err);
     assert(err == CL_SUCCESS);
 
