@@ -4,6 +4,8 @@
 #SBATCH --job-name=test_cancer_code
 #SBATCH --error=job.%J.err
 #SBATCH --output=job.%J.out
+#SBATCH --partition=gpu --gres=gpu
 
 module load compiler/gcc/9 cuda/12.2
-./aa
+gcc -O2 -o cancer main.c -lOpenCL -lm
+./cancer
