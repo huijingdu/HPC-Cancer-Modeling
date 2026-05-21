@@ -108,11 +108,8 @@ float distance3_new(float dx, float dy, float dz)
     return sqrt(dx*dx + dy*dy + dz*dz) + 0.0001;
 }
 
-/*
-Kernel for cell movement using subcellular element model
-The code returns the force for element[gId] of cell[cellId].
-*/
-
+//Kernel for cell movement using subcellular element model
+//The code returns the force for element[gId] of cell[cellId].
 __kernel void movement(
 __global int * id, 
 __global float * x, 
@@ -134,126 +131,104 @@ __const float ly,
 __const float lz,
 __const int max_ele,
 __global int * cell_type,
-__global int * flag_gener)
+__global int * flag_gener,
+__const int nbx,
+__const int nby, 
+__const int nbz,
+__const float bin_size,
+__global const int * bin_offset,
+__global const int * sorted_ids)
 {
     int gId = get_global_id(0); //get the global ID of this work unit.
     int cellId = gId/max_ele;
-    int eleId = gId - max_ele*cellId;
+    int eleId = gId - max_ele * cellId;
     if(cellId >= cell_no || eleId >= ele_per_cell[cellId]) return;
     if(ele_per_cell[cellId] == 0) return;
 
-    int i, j, k, cid;
-    float x_F1 = 0.0f;
-    float y_F1 = 0.0f;
-    float z_F1 = 0.0f;
+    float x_F1 = 0.0f, y_F1 = 0.0f, z_F1 = 0.0f;
+    float r, V;
+    float x_dist, y_dist, z_dist;
+    
+    int my_bx = (int)floor(x[gId] / bin_size);
+    int my_by = (int)floor(y[gId] / bin_size);
+    int my_bz = (int)floor(z[gId] / bin_size);
+    if (my_bx < 0) my_bx = 0;
+    if (my_by < 0) my_by = 0;
+    if (my_bz < 0) my_bz = 0;
+    if (my_bx >= nbx) my_bx = nbx - 1;
+    if (my_by >= nby) my_by = nby - 1;
+    if (my_bz >= nbz) my_bz = nbz - 1; 
+    
+    for (int dz = -1; dz <= 1; ++dz) {
+        int nz = my_bz + dz;
+        if (nz < 0 || nz >= nbz) continue;
+        
+        for (int dy = -1; dy <= 1; ++dy) {
+            int ny_raw = my_by + dy;
+            int ny = (ny_raw + nby) % nby;
+            float y_shift = 0.0f;
+            if (ny_raw < 0) {
+                y_shift = -ly;
+            } else if (ny_raw >= nby) {
+                y_shift = ly;
+            }
+           
+            for (int dx = -1; dx <= 1; ++dx) { 
+                int nx_raw = my_bx + dx;
+                int nx = (nx_raw + nbx) % nbx;
+                float x_shift = 0.0f;
+                if (nx_raw < 0) {
+                    x_shift = -lx;
+                } else if (nx_raw >= nbx) {
+                    x_shift = lx;
+                }
+                
+                int nbin = nx + ny * nbx + nz * nbx * nby;
+                int start = bin_offset[nbin];
+                int end = bin_offset[nbin + 1];
+                
+                for (int p = start; p < end; ++p) {
+                    int i = sorted_ids[p];
+                    if (i == gId) continue;
+                    
+                    x_dist = x[gId] - (x[i] + x_shift);
+                    y_dist = y[gId] - (y[i] + y_shift);
+                    z_dist = z[gId] - z[i];
+                    r = distance3_new(x_dist, y_dist, z_dist);
+                    
 
-    float r = 0.0f;
-    float V = 0.0f; // a temporary variable to store potentials
-
-    float dist = 20.0f;
-    float x_dist = 0.0f;
-    float y_dist = 0.0f;
-    float z_dist = 0.0f;
-    float x_shift = 1.0f;
-    float y_shift = 1.0f;
-
-    for(k = 0; k < cell_no; k++)
-    {
-      // update cell-cell distance
-      // cell-cell interaction enables when the distance is small enough
-      x_dist = fabs(xc[cellId] - xc[k]);
-      if(x_dist > dist && lx-x_dist > dist)
-          continue;
-      y_dist = fabs(yc[cellId] - yc[k]);
-      if(y_dist > dist && ly-y_dist > dist)
-          continue;
-
-      x_shift = 0.0f;
-      if(x_dist > (lx-x_dist))
-      {
-          x_dist = lx-x_dist;
-          if(xc[k] > xc[cellId])
-              x_shift = -1.0f*lx;
-          else
-              x_shift = lx;
-      }
-      y_shift = 0.0f;
-      if(y_dist > (ly-y_dist))
-      {
-          y_dist = ly-y_dist;
-          if(yc[k] > yc[cellId])
-              y_shift = -1.0f*ly;
-          else
-              y_shift = ly;
-      }
-      z_dist = fabs(zc[cellId] - zc[k]);
-
-      r = distance3_new(x_dist, y_dist, z_dist);
-      if(r > dist)
-          continue;
-
-      for(j = 0; j < ele_per_cell[k]; j++)
-      {
-        i = k*max_ele + j;
-
-        x_dist = x[gId] - (x[i]+x_shift);
-        y_dist = y[gId] - (y[i]+y_shift);
-        z_dist = z[gId] - z[i];
-        r = distance3_new(x_dist, y_dist, z_dist);
-        if(i == gId)
-        {
-            // environmental force
-            // if(cell_type[cellId] == 1 && type[gId] == 2)
-            // {
-            //     external_potential(x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1, lx, ly, lz);
-            // }
+                    if (id[gId] == id[i]) {
+                        V = intra_potential(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
+                    } else {
+                        int k = i / max_ele;
+                        if (cell_type[cellId] == cell_type[k]) {
+                            V = inter_potential_same(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
+                        } else if ((cell_type[cellId] + cell_type[k]) == 3) {
+                            V = inter_potential_01(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
+                        } else {
+                            V = inter_potential(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
+                        }
+                    }
+                    x_F1 += V * x_dist;
+                    y_F1 += V * y_dist;
+                    z_F1 += V * z_dist;
+                }
+            }
         }
-        else
-        {
-           if(id[gId] == id[i])
-           {
-              V = intra_potential(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
-           }
-           else
-           {
-              if(cell_type[cellId] == cell_type[k]) 
-              {
-                  V = inter_potential_same(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
-              }
-              else if((cell_type[cellId] + cell_type[k]) == 3)
-              {
-                  V = inter_potential_01(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
-              }
-              else
-              {
-                  V = inter_potential(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
-              }
-           }
-        }
-        x_F1 += V * (x[gId] - (x[i]+x_shift));
-        y_F1 += V * (y[gId] - (y[i]+y_shift));
-        z_F1 += V * (z[gId] - z[i]);
-      }
     }
 
-    float ratio = 0.5;
-    x_F[gId] = ratio * dt * x_F1 + x[gId]; // save the calculated values
+    float ratio = 0.5f;
+    x_F[gId] = ratio * dt * x_F1 + x[gId];
     y_F[gId] = ratio * dt * y_F1 + y[gId];
     z_F[gId] = ratio * dt * z_F1 + z[gId];
-
-    if(z_F[gId] < -1.0)
-        z_F[gId] = -1.0 + 0.05*eleId;
-
-    x_dist = x[gId] - x_F[gId];
-    y_dist = y[gId] - y_F[gId];
-    z_dist = z[gId] - z_F[gId];
-    r = distance3_new(x_dist, y_dist, z_dist);
+    
+    if (z_F[gId] < -1.0f) z_F[gId] = -1.0f + 0.05f * eleId;
+    
     r = distance3(x[gId], y[gId], z[gId], x_F[gId], y_F[gId], z_F[gId], lx, ly, lz);
-    if(r > 4.0) // restrict maximum displacement per step
-    {
-        x_F[gId] = (x_F[gId] - x[gId])/r*(3.5+eleId/20.0) + x[gId];
-        y_F[gId] = (y_F[gId] - y[gId])/r*(3.5+eleId/20.0) + y[gId];
-        z_F[gId] = (z_F[gId] - z[gId])/r*(3.5+eleId/20.0) + z[gId];
+    if (r > 4.0f) {
+        x_F[gId] = (x_F[gId] - x[gId]) / r * (3.5f + eleId / 20.0f) + x[gId];
+        y_F[gId] = (y_F[gId] - y[gId]) / r * (3.5f + eleId / 20.0f) + y[gId];
+        z_F[gId] = (z_F[gId] - z[gId]) / r * (3.5f + eleId / 20.0f) + z[gId];
     }
 }
 
