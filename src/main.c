@@ -34,24 +34,13 @@
 #endif
 
 #define BIN_SIZE 12.0f
-#define NBX 4
-#define NBY 4
-#define NBZ 7
-#define NBINS (NBX * NBY * NBZ)
+#define g_dx_TARGET 1.0f
+#define PAD 5.0f
+#define CELL_GROWTH 2.0f
+#define MAX_ELE 20
 
 #define BC 0
 #define RATIO 1
-#define NX 40
-#define NY NX
-#define NZ 80
-#define NEQ  NX*NY*NZ          /* problem dimension */
-
-#define LX 40.0
-#define LY LX
-#define LZ 80.0
-#define DX LX/NX
-#define DY DX
-#define DZ DX
 
 #define GROWTH_FR 1000
 #define DIVISION_FR 1000
@@ -59,8 +48,6 @@
 
 #define MAX_ITERATIONS 400001
 #define MAX_CHEM_ITER  1000
-#define MAX_CELL 2000
-#define MAX_ELE 20
 #define MAX_DEATH 60000
 
 #define C1_MEAN 180.0 // slow-dividing doubles in 180 days
@@ -69,12 +56,11 @@
 #define C2_STD 1.0 // standard deviation
 #define MAX_GENER 2
 
-static const int nx = NX;
-static const int ny = NY;
-static const int nz = NZ;
-static const float lx = LX;
-static const float ly = LY;
-static const float lz = LZ;
+static int g_nx, g_ny, g_nz;
+static int g_nbx, g_nby, g_nbz, g_nbins;
+static int g_max_cell;
+static float g_lx, g_ly, g_lz;
+static float g_dx, g_dy, g_dz;
 
 static const float R_Diff = 0.01; // probability that a slow-dividing cell gives birth to a fast-divising daughter
 
@@ -96,6 +82,43 @@ float RNG()
     return (random);
 }
 
+void sniff_ic(const char InName[], int *cell_no_out, float *mx_out, float *my_out, float *mz_out) {
+    FILE *fp = fopen(InName, "r");
+    if (!fp) {
+        printf("sniff_ic: cannot open %s\n", InName);
+        exit(1);
+    }
+    
+    int temp_cell_no = 0;
+    if (fscanf(fp, "%d", &temp_cell_no) != 1) {
+        printf("sniff_ic: bad header in %s\n", InName);
+        exit(1);
+    }
+
+    int actual = 0;
+    float mx = 0.0f, my = 0.0f, mz = 0.0f;
+    float px, py, pz, pxc, pyc, pzc;
+    int pid, ptype, pele, ptime, pcyc;
+
+    for (int i = 0; i < temp_cell_no; i++) {
+        fscanf(fp, "%d %d %d %f %f %f %d %d\n",
+                &pid, &pele, &ptype, &pxc, &pyc, &pzc, &ptime, &pcyc);
+        if (pele <= 0) continue;
+        for (int j = 0; j < pele; j++) {
+            fscanf(fp, "%f %f %f", &px, &py, &pz);
+            if (px > mx) mx = px;
+            if (py > my) my = py;
+            if (pz > pz) mz = py;
+        }
+        actual++;
+    }
+    fclose(fp);
+    
+    *cell_no_out = actual;
+    *mx_out = mx;
+    *my_out = my;
+    *mz_out = mz;
+}
 
 // Reader for initial cells' location
 // From file Input/IC
@@ -198,7 +221,7 @@ void output(float * x, float * y, float * z, float * xc, float * yc, float * zc,
         {
             k = i*MAX_ELE+j;
 
-            if(z[k] > LZ+2.0)
+            if(z[k] > g_lz+2.0)
                 flag_skip = 1;;
         }
         if(flag_skip == 1) continue;
@@ -259,36 +282,36 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     float * xF = (float *)malloc(max_ele_no*sizeof(float));
     float * yF = (float *)malloc(max_ele_no*sizeof(float));
     float * zF = (float *)malloc(max_ele_no*sizeof(float));
-    float * xc = (float *)malloc(MAX_CELL*sizeof(float));
-    float * yc = (float *)malloc(MAX_CELL*sizeof(float));
-    float * zc = (float *)malloc(MAX_CELL*sizeof(float));
-    int * flag = (int *)malloc(MAX_CELL*sizeof(int));
+    float * xc = (float *)malloc(g_max_cell*sizeof(float));
+    float * yc = (float *)malloc(g_max_cell*sizeof(float));
+    float * zc = (float *)malloc(g_max_cell*sizeof(float));
+    int * flag = (int *)malloc(g_max_cell*sizeof(int));
     float * rand_no = (float *)malloc(max_ele_no*sizeof(float));
-    float * chem1_gpu = (float *)malloc(NX*NY*NZ*sizeof(float));
-    float * chem2_gpu = (float *)malloc(NX*NY*NZ*sizeof(float));
-    float * chem11_gpu = (float *)malloc(NX*NY*NZ*sizeof(float));
-    float * chem22_gpu = (float *)malloc(NX*NY*NZ*sizeof(float));
-    int * grid_gpu = (int *)malloc(NX*NY*NZ*sizeof(int));
-    int * grid1_gpu = (int *)malloc(NX*NY*NZ*sizeof(int));
-    int * grid2_gpu = (int *)malloc(NX*NY*NZ*sizeof(int));
-    int * grid3_gpu = (int *)malloc(NX*NY*NZ*sizeof(int));
-    int * grid4_gpu = (int *)malloc(NX*NY*NZ*sizeof(int));
-    int * flag_death = (int *)malloc(MAX_CELL*sizeof(int));
-    int * flag_gener = (int *)malloc(MAX_CELL*sizeof(int));
-    float * OVOL1 = (float *)malloc(MAX_CELL*sizeof(float));
-    float * OVOL2 = (float *)malloc(MAX_CELL*sizeof(float));
-    float * vx = (float *)malloc(NX*NY*NZ*sizeof(float));
-    float * vy = (float *)malloc(NX*NY*NZ*sizeof(float));
-    float * vz = (float *)malloc(NX*NY*NZ*sizeof(float));
+    float * chem1_gpu = (float *)malloc(g_nx*g_ny*g_nz*sizeof(float));
+    float * chem2_gpu = (float *)malloc(g_nx*g_ny*g_nz*sizeof(float));
+    float * chem11_gpu = (float *)malloc(g_nx*g_ny*g_nz*sizeof(float));
+    float * chem22_gpu = (float *)malloc(g_nx*g_ny*g_nz*sizeof(float));
+    int * grid_gpu = (int *)malloc(g_nx*g_ny*g_nz*sizeof(int));
+    int * grid1_gpu = (int *)malloc(g_nx*g_ny*g_nz*sizeof(int));
+    int * grid2_gpu = (int *)malloc(g_nx*g_ny*g_nz*sizeof(int));
+    int * grid3_gpu = (int *)malloc(g_nx*g_ny*g_nz*sizeof(int));
+    int * grid4_gpu = (int *)malloc(g_nx*g_ny*g_nz*sizeof(int));
+    int * flag_death = (int *)malloc(g_max_cell*sizeof(int));
+    int * flag_gener = (int *)malloc(g_max_cell*sizeof(int));
+    float * OVOL1 = (float *)malloc(g_max_cell*sizeof(float));
+    float * OVOL2 = (float *)malloc(g_max_cell*sizeof(float));
+    float * vx = (float *)malloc(g_nx*g_ny*g_nz*sizeof(float));
+    float * vy = (float *)malloc(g_nx*g_ny*g_nz*sizeof(float));
+    float * vz = (float *)malloc(g_nx*g_ny*g_nz*sizeof(float));
     float * xo = (float *)malloc(max_ele_no*sizeof(float));
     float * yo = (float *)malloc(max_ele_no*sizeof(float));
     float * zo = (float *)malloc(max_ele_no*sizeof(float));
 
     // Bin realated declarations
     int * bin_id_host = (int *)malloc(max_ele_no * sizeof(int));
-    int * bin_count_host = (int *)malloc(NBINS * sizeof(int));
-    int * bin_offset_host = (int *)malloc((NBINS + 1) * sizeof(int));
-    int * bin_pos_host = (int *)malloc(NBINS * sizeof(int));
+    int * bin_count_host = (int *)malloc(g_nbins * sizeof(int));
+    int * bin_offset_host = (int *)malloc((g_nbins + 1) * sizeof(int));
+    int * bin_pos_host = (int *)malloc(g_nbins * sizeof(int));
     int * sorted_ids_host = (int *)malloc(max_ele_no * sizeof(int));
 
 
@@ -299,7 +322,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         xF[i] = yF[i] = zF[i] = 0.0f;
         xo[i] = yo[i] = zo[i] = 0.0f;
     }
-    for(int i = 0; i < MAX_CELL; i++)
+    for(int i = 0; i < g_max_cell; i++)
     {
         xc[i] = yc[i] = zc[i] = 0.0;
         flag[i] = flag_death[i] = flag_gener[i] = 0;
@@ -394,9 +417,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
     // Bin buffer allocation (requires context)
     bin_id_mem     = clCreateBuffer(context, CL_MEM_READ_WRITE, max_ele_no * sizeof(int), NULL, &err);
-    bin_count_mem  = clCreateBuffer(context, CL_MEM_READ_WRITE, NBINS * sizeof(int), NULL, &err);
-    bin_offset_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, (NBINS + 1) * sizeof(int), NULL, &err);
-    bin_pos_mem    = clCreateBuffer(context, CL_MEM_READ_WRITE, NBINS * sizeof(int), NULL, &err);
+    bin_count_mem  = clCreateBuffer(context, CL_MEM_READ_WRITE, g_nbins * sizeof(int), NULL, &err);
+    bin_offset_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, (g_nbins + 1) * sizeof(int), NULL, &err);
+    bin_pos_mem    = clCreateBuffer(context, CL_MEM_READ_WRITE, g_nbins * sizeof(int), NULL, &err);
     sorted_ids_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, max_ele_no * sizeof(int), NULL, &err);
     assert(err == CL_SUCCESS);
 	
@@ -571,7 +594,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 									(void*)ele_type, 0, NULL, NULL);
     	assert(err == CL_SUCCESS);
 		
-    	buffer_size = sizeof(int) * MAX_CELL;
+    	buffer_size = sizeof(int) * g_max_cell;
         cell_type_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, NULL);
         err = clEnqueueWriteBuffer(cmd_queue, cell_type_mem, CL_TRUE, 0, buffer_size,
                                     (void*)cell_type, 0, NULL, NULL);
@@ -589,7 +612,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                                     (void*)flag_gener, 0, NULL, NULL);
     	assert(err == CL_SUCCESS);
 
-    	buffer_size = sizeof(float) * MAX_CELL;
+    	buffer_size = sizeof(float) * g_max_cell;
     	xc_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, NULL);
     	err = clEnqueueWriteBuffer(cmd_queue, xc_mem, CL_TRUE, 0, buffer_size,
 								   (void*)xc, 0, NULL, NULL);
@@ -607,7 +630,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                                    (void*)OVOL2, 0, NULL, NULL);
     	assert(err == CL_SUCCESS);
 
-        buffer_size = sizeof(float) * NX*NY*NZ;
+        buffer_size = sizeof(float) * g_nx*g_ny*g_nz;
         chem1_gpu_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, NULL);
         err = clEnqueueWriteBuffer(cmd_queue, chem1_gpu_mem, CL_TRUE, 0, buffer_size,
                                    (void*)chem1_gpu, 0, NULL, NULL);
@@ -631,7 +654,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                                    (void*)vz, 0, NULL, NULL);
     	assert(err == CL_SUCCESS);
 
-        buffer_size = sizeof(int) * NX*NY*NZ;
+        buffer_size = sizeof(int) * g_nx*g_ny*g_nz;
         grid_gpu_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, NULL);
         err |= clEnqueueWriteBuffer(cmd_queue, grid_gpu_mem, CL_TRUE, 0, buffer_size,
                                    (void*)grid_gpu, 0, NULL, NULL);
@@ -680,9 +703,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     	err |= clSetKernelArg(kernel[0], 12, sizeof(cl_mem), &xF_mem);
     	err |= clSetKernelArg(kernel[0], 13, sizeof(cl_mem), &yF_mem);
     	err |= clSetKernelArg(kernel[0], 14, sizeof(cl_mem), &zF_mem);
-    	err |= clSetKernelArg(kernel[0], 15, sizeof(float), &lx);
-    	err |= clSetKernelArg(kernel[0], 16, sizeof(float), &ly);
-    	err |= clSetKernelArg(kernel[0], 17, sizeof(float), &lz);
+    	err |= clSetKernelArg(kernel[0], 15, sizeof(float), &g_lx);
+    	err |= clSetKernelArg(kernel[0], 16, sizeof(float), &g_ly);
+    	err |= clSetKernelArg(kernel[0], 17, sizeof(float), &g_lz);
     	err |= clSetKernelArg(kernel[0], 18, sizeof(int), &max_ele);
     	err |= clSetKernelArg(kernel[0], 19, sizeof(cl_mem), &cell_type_mem);
         err |= clSetKernelArg(kernel[0], 20, sizeof(cl_mem), &flag_gener_mem);
@@ -701,9 +724,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     	err |= clSetKernelArg(kernel[1],  5, sizeof(int), &ele_no);
     	err |= clSetKernelArg(kernel[1],  6, sizeof(cl_mem), &flag_mem);
     	err |= clSetKernelArg(kernel[1],  7, sizeof(cl_mem), &ele_per_cell_mem);
-    	err |= clSetKernelArg(kernel[1],  8, sizeof(float), &lx);
-    	err |= clSetKernelArg(kernel[1],  9, sizeof(float), &ly);
-    	err |= clSetKernelArg(kernel[1], 10, sizeof(float), &lz);
+    	err |= clSetKernelArg(kernel[1],  8, sizeof(float), &g_lx);
+    	err |= clSetKernelArg(kernel[1],  9, sizeof(float), &g_ly);
+    	err |= clSetKernelArg(kernel[1], 10, sizeof(float), &g_lz);
     	err |= clSetKernelArg(kernel[1], 11, sizeof(int), &max_ele);
     	err |= clSetKernelArg(kernel[1], 12, sizeof(cl_mem), &cell_type_mem);
     	err |= clSetKernelArg(kernel[1], 13, sizeof(cl_mem), &flag_death_mem);
@@ -722,15 +745,15 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         err |= clSetKernelArg(kernel[4],  6, sizeof(cl_mem), &yc_mem);
         err |= clSetKernelArg(kernel[4],  7, sizeof(cl_mem), &zc_mem);
     	err |= clSetKernelArg(kernel[4],  8, sizeof(int), &max_ele);
-    	err |= clSetKernelArg(kernel[4],  9, sizeof(float), &lx);
-    	err |= clSetKernelArg(kernel[4], 10, sizeof(float), &ly);
-    	err |= clSetKernelArg(kernel[4], 11, sizeof(float), &lz);
+    	err |= clSetKernelArg(kernel[4],  9, sizeof(float), &g_lx);
+    	err |= clSetKernelArg(kernel[4], 10, sizeof(float), &g_ly);
+    	err |= clSetKernelArg(kernel[4], 11, sizeof(float), &g_lz);
         assert(err == CL_SUCCESS);
     }
 
     {
-        int nx0 = NX, ny0 = NY, nz0 = NZ, tmpii = 0;
-        float dx0 = DX, dy0 = DY, dz0 = DZ;
+        int nx0 = g_nx, ny0 = g_ny, nz0 = g_nz, tmpii = 0;
+        float dx0 = g_dx, dy0 = g_dy, dz0 = g_dz;
         float dt_chem = 1.0*dt;
         // Now setup the arguments to kernel "chem_rk_gpu"
         err  = clSetKernelArg(kernel[5],  0, sizeof(cl_mem), &chem1_gpu_mem);
@@ -761,6 +784,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         int max_ele = MAX_ELE;
         // Now setup the arguments to kernel "ovol_fun"
         err  = clSetKernelArg(kernel[7],  0, sizeof(cl_mem), &id_mem);
+        assert(err == CL_SUCCESS);
         err |= clSetKernelArg(kernel[7],  1, sizeof(cl_mem), &x_mem);
         err |= clSetKernelArg(kernel[7],  2, sizeof(cl_mem), &y_mem);
         err |= clSetKernelArg(kernel[7],  3, sizeof(cl_mem), &z_mem);
@@ -771,12 +795,18 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         err |= clSetKernelArg(kernel[7],  8, sizeof(cl_mem), &o2_mem);
         err |= clSetKernelArg(kernel[7],  9, sizeof(int), &max_ele);
         err |= clSetKernelArg(kernel[7], 10, sizeof(cl_mem), &cell_type_mem);
+        err |= clSetKernelArg(kernel[7], 11, sizeof(int), &g_nx);
+        err |= clSetKernelArg(kernel[7], 12, sizeof(int), &g_ny);
+        err |= clSetKernelArg(kernel[7], 13, sizeof(int), &g_nz);
+        err |= clSetKernelArg(kernel[7], 14, sizeof(float), &g_lx);
+        err |= clSetKernelArg(kernel[7], 15, sizeof(float), &g_ly);
+        err |= clSetKernelArg(kernel[7], 16, sizeof(float), &g_lz);
         assert(err == CL_SUCCESS);
     }
     
     {
         const float bin_size_f = BIN_SIZE;
-        const int nbx_i = NBX, nby_i = NBY, nbz_i = NBZ, nbins_i = NBINS;
+        const int nbx_i = g_nbx, nby_i = g_nby, nbz_i = g_nbz, nbins_i = g_nbins;
         const int max_ele_i = MAX_ELE;
 
         // kernel[8] bin_assign
@@ -827,11 +857,11 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
 #if 0
     // update the initial chemical field
-    for(int i = 0; i < NX; i++)    
-        for(int j = 0; j < NY; j++)    
-            for(int k = 0; k < NZ; k++) 
+    for(int i = 0; i < g_nx; i++)    
+        for(int j = 0; j < g_ny; j++)    
+            for(int k = 0; k < g_nz; k++) 
     {
-        int indx = i + j*NX + k*NX*NY;
+        int indx = i + j*g_nx + k*g_nx*g_ny;
         chem1_gpu[indx] = chem1[i][j][k];
         chem2_gpu[indx] = chem2[i][j][k];
         grid_gpu[indx] = grid[i][j][k];
@@ -840,19 +870,19 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         grid3_gpu[indx] = grid3[i][j][k];
         grid4_gpu[indx] = grid4[i][j][k];
     }   
-    err = clEnqueueWriteBuffer(cmd_queue, chem1_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(float),
+    err = clEnqueueWriteBuffer(cmd_queue, chem1_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(float),
                         (void*)chem1_gpu, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(cmd_queue, chem2_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(float),
+    err |= clEnqueueWriteBuffer(cmd_queue, chem2_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(float),
                         (void*)chem2_gpu, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(cmd_queue, grid_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(int),
+    err |= clEnqueueWriteBuffer(cmd_queue, grid_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(int),
                         (void*)grid_gpu, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(cmd_queue, grid1_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(int),
+    err |= clEnqueueWriteBuffer(cmd_queue, grid1_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(int),
                         (void*)grid1_gpu, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(cmd_queue, grid2_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(int),
+    err |= clEnqueueWriteBuffer(cmd_queue, grid2_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(int),
                         (void*)grid2_gpu, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(cmd_queue, grid3_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(int),
+    err |= clEnqueueWriteBuffer(cmd_queue, grid3_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(int),
                         (void*)grid3_gpu, 0, NULL, NULL);
-    err |= clEnqueueWriteBuffer(cmd_queue, grid4_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(int),
+    err |= clEnqueueWriteBuffer(cmd_queue, grid4_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(int),
                         (void*)grid4_gpu, 0, NULL, NULL);
     assert(err == CL_SUCCESS);
 #endif
@@ -891,11 +921,11 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             assert(err == CL_SUCCESS);
             // map cells to a grid using their locations
             cell_in_block(x, y, z, id, cell_type, ele_type, cell_no, ele_per_cell, xo, yo, zo, vx, vy, vz);
-            for(int i = 0; i < NX; i++)    
-                for(int j = 0; j < NY; j++)    
-                    for(int k = 0; k < NZ; k++) 
+            for(int i = 0; i < g_nx; i++)    
+                for(int j = 0; j < g_ny; j++)    
+                    for(int k = 0; k < g_nz; k++) 
             {
-                int indx = i + j*NX + k*NX*NY;
+                int indx = i + j*g_nx + k*g_nx*g_ny;
                 grid_gpu[indx] = grid[i][j][k];
                 grid1_gpu[indx] = grid1[i][j][k];
                 grid2_gpu[indx] = grid2[i][j][k];
@@ -903,7 +933,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                 grid4_gpu[indx] = grid4[i][j][k];
             }   
 
-            buffer_size = sizeof(int) * NX*NY*NZ;
+            buffer_size = sizeof(int) * g_nx*g_ny*g_nz;
             err = clEnqueueWriteBuffer(cmd_queue, grid_gpu_mem, CL_TRUE, 0, buffer_size,
                                 (void*)grid_gpu, 0, NULL, NULL);
             err |= clEnqueueWriteBuffer(cmd_queue, grid1_gpu_mem, CL_TRUE, 0, buffer_size,
@@ -915,7 +945,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             err |= clEnqueueWriteBuffer(cmd_queue, grid4_gpu_mem, CL_TRUE, 0, buffer_size,
                                 (void*)grid4_gpu, 0, NULL, NULL);
             assert(err == CL_SUCCESS);
-            buffer_size = sizeof(float) * NX*NY*NZ;
+            buffer_size = sizeof(float) * g_nx*g_ny*g_nz;
             err = clEnqueueWriteBuffer(cmd_queue, vx_mem, CL_TRUE, 0, buffer_size,
                                 (void*)vx, 0, NULL, NULL);
             err |= clEnqueueWriteBuffer(cmd_queue, vy_mem, CL_TRUE, 0, buffer_size,
@@ -926,7 +956,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
             /*
             // update chemical field
-            size_t global_work_size = NX*NY*NZ;
+            size_t global_work_size = g_nx*g_ny*g_nz;
             for(int iter_chem = 0; iter_chem < MAX_CHEM_ITER; iter_chem++)
             {
                 err = clSetKernelArg(kernel[5], 15, sizeof(int), &(iter_chem));
@@ -934,9 +964,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                                          &global_work_size, NULL, 0, NULL, NULL);
                 assert(err == CL_SUCCESS);
 
-                err = clEnqueueCopyBuffer(cmd_queue, chem11_gpu_mem, chem1_gpu_mem, 0, 0, NX*NY*NZ*sizeof(float),
+                err = clEnqueueCopyBuffer(cmd_queue, chem11_gpu_mem, chem1_gpu_mem, 0, 0, g_nx*g_ny*g_nz*sizeof(float),
                                   0, 0, NULL);
-                err |= clEnqueueCopyBuffer(cmd_queue, chem22_gpu_mem, chem2_gpu_mem, 0, 0, NX*NY*NZ*sizeof(float),
+                err |= clEnqueueCopyBuffer(cmd_queue, chem22_gpu_mem, chem2_gpu_mem, 0, 0, g_nx*g_ny*g_nz*sizeof(float),
                                   0, 0, NULL);
                 assert(err == CL_SUCCESS);
             }
@@ -970,9 +1000,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         
         // zero histogram and write cursor
         err |= clEnqueueFillBuffer(cmd_queue, bin_count_mem, &zero_int, sizeof(int),
-                                    0, NBINS * sizeof(int), 0, NULL, NULL);
+                                    0, g_nbins * sizeof(int), 0, NULL, NULL);
         err |= clEnqueueFillBuffer(cmd_queue, bin_pos_mem, &zero_int, sizeof(int),
-                                    0, NBINS * sizeof(int), 0, NULL, NULL);
+                                    0, g_nbins * sizeof(int), 0, NULL, NULL);
 
         err |= clEnqueueNDRangeKernel(cmd_queue, kernel[8], 1, NULL, &bin_global, NULL, 0, NULL, NULL);
         err |= clEnqueueNDRangeKernel(cmd_queue, kernel[9], 1, NULL, &bin_global, NULL, 0, NULL, NULL);
@@ -1017,7 +1047,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             {
                 flag[i] = 0;
             }
-	        buffer_size = sizeof(int) * MAX_CELL;
+	        buffer_size = sizeof(int) * g_max_cell;
   	        err = clEnqueueWriteBuffer(cmd_queue, flag_mem, CL_TRUE, 0, buffer_size,
 	    						(void*)flag, 0, NULL, NULL);
 	    	err |= clEnqueueWriteBuffer(cmd_queue, flag_death_mem, CL_TRUE, 0, buffer_size,
@@ -1042,7 +1072,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
 #if 0
         // start of cell division
-        if((iter-1)%DIVISION_FR == 0 && cell_no < MAX_CELL)
+        if((iter-1)%DIVISION_FR == 0 && cell_no < g_max_cell)
         {
             err = clEnqueueReadBuffer(cmd_queue, id_mem, CL_TRUE, 0, max_ele_no*sizeof(int),
                               id, 0, NULL, NULL);
@@ -1056,15 +1086,15 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                               ele_type, 0, NULL, NULL);
             err |= clEnqueueReadBuffer(cmd_queue, ele_per_cell_mem, CL_TRUE, 0, cell_no*sizeof(int),
                               ele_per_cell, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, chem1_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(float),
+            err |= clEnqueueReadBuffer(cmd_queue, chem1_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(float),
                               chem1_gpu, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, chem2_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(float),
+            err |= clEnqueueReadBuffer(cmd_queue, chem2_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(float),
                               chem2_gpu, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, xc_mem, CL_TRUE, 0, MAX_CELL*sizeof(float),
+            err |= clEnqueueReadBuffer(cmd_queue, xc_mem, CL_TRUE, 0, g_max_cell*sizeof(float),
                               xc, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, yc_mem, CL_TRUE, 0, MAX_CELL*sizeof(float),
+            err |= clEnqueueReadBuffer(cmd_queue, yc_mem, CL_TRUE, 0, g_max_cell*sizeof(float),
                               yc, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, zc_mem, CL_TRUE, 0, MAX_CELL*sizeof(float),
+            err |= clEnqueueReadBuffer(cmd_queue, zc_mem, CL_TRUE, 0, g_max_cell*sizeof(float),
                               zc, 0, NULL, NULL);
             assert(err == CL_SUCCESS);
 
@@ -1283,7 +1313,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                 {
                     tmp_cell_no++;
                 }
-                if(tmp_cell_no >= MAX_CELL)
+                if(tmp_cell_no >= g_max_cell)
                 {
                     exit(0);
                 } 
@@ -1402,11 +1432,11 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 								  id, 0, NULL, NULL);
             err |= clEnqueueReadBuffer(cmd_queue, ele_type_mem, CL_TRUE, 0, max_ele_no*sizeof(int), 
 								  ele_type, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, ele_per_cell_mem, CL_TRUE, 0, MAX_CELL*sizeof(int), 
+            err |= clEnqueueReadBuffer(cmd_queue, ele_per_cell_mem, CL_TRUE, 0, g_max_cell*sizeof(int), 
 								  ele_per_cell, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, chem1_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(float), 
+            err |= clEnqueueReadBuffer(cmd_queue, chem1_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(float), 
 								  chem1_gpu, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, chem2_gpu_mem, CL_TRUE, 0, NX*NY*NZ*sizeof(float), 
+            err |= clEnqueueReadBuffer(cmd_queue, chem2_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(float), 
 								  chem2_gpu, 0, NULL, NULL);
             assert(err == CL_SUCCESS);
             output(x, y, z, xc, yc, zc, id, cell_type, ele_type, cell_no, ele_no, ele_per_cell, iter, chem1_gpu, chem2_gpu, cclock, cycle, flag_gener, vx, vy, vz);
@@ -1440,7 +1470,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             {
                 exit(0);
             }
-            if(count1 >= 300 || count2 >= 300 || count3 >= 300 || count4 >= 300)
+            if(count1 >= g_max_cell - 10 || count2 >= g_max_cell - 10 || count3 >= g_max_cell - 10|| count4 >= g_max_cell - 10)
             {
                 exit(0);
             }
@@ -1486,16 +1516,16 @@ void  cell_in_block(float * x, float * y, float * z, int * id, int * cell_type, 
     int i, j, k, index;
     int ni, nj, nk;
 
-    for(i = 0; i < NX; i++)
-        for(j = 0; j < NY; j++)
-            for(k = 0; k < NZ; k++)
+    for(i = 0; i < g_nx; i++)
+        for(j = 0; j < g_ny; j++)
+            for(k = 0; k < g_nz; k++)
     {
         grid[i][j][k] = 0;
         grid1[i][j][k] = 0;
         grid2[i][j][k] = 0;
         grid3[i][j][k] = 0;
         grid4[i][j][k] = 0;
-        index = i + j*NX + k*NX*NY;
+        index = i + j*g_nx + k*g_nx*g_ny;
         vx[index] = 0.0;
         vy[index] = 0.0;
         vz[index] = 0.0;
@@ -1506,11 +1536,11 @@ void  cell_in_block(float * x, float * y, float * z, int * id, int * cell_type, 
         for(j = 0; j < ele_per_cell[i]; j++)
         {
             k = i*MAX_ELE + j;
-            ni = (int)(1.0*x[k]/(1.0*DX)); if(ni < 0) ni = 0; if(ni >= NX) ni = NX-1;
-            nj = (int)(1.0*y[k]/(1.0*DY)); if(nj < 0) nj = 0; if(nj >= NY) nj = NY-1;
-            nk = (int)(1.0*z[k]/(1.0*DZ)); if(nk < 0) nk = 0; if(nk >= NZ) nk = NZ-1;
+            ni = (int)(1.0*x[k]/(1.0*g_dx)); if(ni < 0) ni = 0; if(ni >= g_nx) ni = g_nx-1;
+            nj = (int)(1.0*y[k]/(1.0*g_dy)); if(nj < 0) nj = 0; if(nj >= g_ny) nj = g_ny-1;
+            nk = (int)(1.0*z[k]/(1.0*g_dz)); if(nk < 0) nk = 0; if(nk >= g_nz) nk = g_nz-1;
 
-            index = ni + nj*NX + nk*NX*NY;
+            index = ni + nj*g_nx + nk*g_nx*g_ny;
             vx[index] += x[k] - xo[k];
             vy[index] += y[k] - yo[k];
             vz[index] += z[k] - zo[k];
@@ -1543,11 +1573,11 @@ void  cell_in_block(float * x, float * y, float * z, int * id, int * cell_type, 
         }
     } 
 
-    for(i = 0; i < NX; i++)
-        for(j = 0; j < NY; j++)
-            for(k = 0; k < NZ; k++)
+    for(i = 0; i < g_nx; i++)
+        for(j = 0; j < g_ny; j++)
+            for(k = 0; k < g_nz; k++)
     {
-        index = i + j*NX + k*NX*NY;
+        index = i + j*g_nx + k*g_nx*g_ny;
         if(grid[i][j][k] == 0)
         {
             vx[index] = 0.0;
@@ -1571,9 +1601,9 @@ void  initial_chem_paras(float * x, float * y, float * z, int * id, int * cell_t
     int i0, i1, j0, j1, k0, k1;
     float cc = 0.05;
 
-    for(i = 0; i < NX; i++)
-        for(j = 0; j < NY; j++)
-            for(k = 0; k < NZ; k++)
+    for(i = 0; i < g_nx; i++)
+        for(j = 0; j < g_ny; j++)
+            for(k = 0; k < g_nz; k++)
     {
         grid[i][j][k] = 0;
         chem1[i][j][k] = 0.0;
@@ -1592,11 +1622,11 @@ void  cell_lineage(int id, float x, float y, float z, int ctype0, int * ctype1, 
 
     float alpha = 10000.0;
 
-    ni = (int)(x/(1.0*DX)); if(ni < 0) ni = 0; if(ni >= NX) ni = NX-1;
-    nj = (int)(y/(1.0*DY)); if(nj < 0) nj = 0; if(nj >= NY) nj = NY-1;
-    nk = (int)(z/(1.0*DZ)); if(nk < 0) nk = 0; if(nk >= NZ) nk = NZ-1;
+    ni = (int)(x/(1.0*g_dx)); if(ni < 0) ni = 0; if(ni >= g_nx) ni = g_nx-1;
+    nj = (int)(y/(1.0*g_dy)); if(nj < 0) nj = 0; if(nj >= g_ny) nj = g_ny-1;
+    nk = (int)(z/(1.0*g_dz)); if(nk < 0) nk = 0; if(nk >= g_nz) nk = g_nz-1;
 
-    i = ni + nj*NX + nk*NX*NY;
+    i = ni + nj*g_nx + nk*g_nx*g_ny;
     cc = chem1_gpu[i]/1.0;
     if(ctype0 == 1)
     {
@@ -1647,10 +1677,32 @@ int main (int argc, const char * argv[]) {
 
     int i, j, k;
    
-    char InName[] = "Input/IC";
-    int max_ele_no = MAX_CELL*MAX_ELE; //DEFAULT_MAX_ELE_NO;
+    char InName[] = "Input/IC_10K";
+    int sniff_cell_no;
+    float mx, my, mz;
+    sniff_ic(InName, &sniff_cell_no, &mx, &my, &mz);
+
+    g_lx = mx + PAD;
+    g_ly = my + PAD;
+    g_lz = mz + PAD;
+
+    g_nx = (int)ceilf(g_lx / g_dx_TARGET);
+    g_ny = (int)ceilf(g_ly / g_dx_TARGET);
+    g_nz = (int)ceilf(g_lz / g_dx_TARGET);
+    g_dx = g_lx / g_nx;
+    g_dy = g_ly / g_ny;
+    g_dz = g_lz / g_nz;
+
+    g_nbx = (int)ceilf(g_lx / BIN_SIZE);
+    g_nby = (int)ceilf(g_ly / BIN_SIZE);
+    g_nbz = (int)ceilf(g_lz / BIN_SIZE);
+    g_nbins = g_nbx * g_nby * g_nbx;
+    
+    g_max_cell = (int)(sniff_cell_no * CELL_GROWTH);
+
+    int max_ele_no = g_max_cell * MAX_ELE;
     int ele_no = 0;
-    int cell_no = 0; 
+    int cell_no = 0;
     float dt = 0.1;
 
     int n = 100;
@@ -1660,66 +1712,66 @@ int main (int argc, const char * argv[]) {
     float * z = (float *)malloc(max_ele_no*sizeof(float));
     int * id = (int *)malloc(max_ele_no*sizeof(int));
     int * ele_type = (int *)malloc(max_ele_no*sizeof(int));
-    int * cell_type = (int *)malloc(MAX_CELL*sizeof(int));
-    int * ele_per_cell = (int *)malloc(MAX_CELL*sizeof(int));
-    int * cclock = (int *)malloc(MAX_CELL*sizeof(int));
-    int * cycle = (int *)malloc(MAX_CELL*sizeof(int));
+    int * cell_type = (int *)malloc(g_max_cell*sizeof(int));
+    int * ele_per_cell = (int *)malloc(g_max_cell*sizeof(int));
+    int * cclock = (int *)malloc(g_max_cell*sizeof(int));
+    int * cycle = (int *)malloc(g_max_cell*sizeof(int));
 
-    chem1 = (float ***)malloc(NX*sizeof(float**));
-    for(i = 0; i < NX; i++)
+    chem1 = (float ***)malloc(g_nx*sizeof(float**));
+    for(i = 0; i < g_nx; i++)
     {
-        chem1[i] = (float **)malloc(NY*sizeof(float*));
-        for(j = 0; j < NY; j++)
-            chem1[i][j] = (float *)malloc(NZ*sizeof(float));
+        chem1[i] = (float **)malloc(g_ny*sizeof(float*));
+        for(j = 0; j < g_ny; j++)
+            chem1[i][j] = (float *)malloc(g_nz*sizeof(float));
     }
-    chem2 = (float ***)malloc(NX*sizeof(float**));
-    for(i = 0; i < NX; i++)
+    chem2 = (float ***)malloc(g_nx*sizeof(float**));
+    for(i = 0; i < g_nx; i++)
     {
-        chem2[i] = (float **)malloc(NY*sizeof(float*));
-        for(j = 0; j < NY; j++)
-            chem2[i][j] = (float *)malloc(NZ*sizeof(float));
+        chem2[i] = (float **)malloc(g_ny*sizeof(float*));
+        for(j = 0; j < g_ny; j++)
+            chem2[i][j] = (float *)malloc(g_nz*sizeof(float));
     }
-    chem_diff = (float ***)malloc(NX*sizeof(float**));
-    for(i = 0; i < NX; i++)
+    chem_diff = (float ***)malloc(g_nx*sizeof(float**));
+    for(i = 0; i < g_nx; i++)
     {
-        chem_diff[i] = (float **)malloc(NY*sizeof(float*));
-        for(j = 0; j < NY; j++)
-            chem_diff[i][j] = (float *)malloc(NZ*sizeof(float));
+        chem_diff[i] = (float **)malloc(g_ny*sizeof(float*));
+        for(j = 0; j < g_ny; j++)
+            chem_diff[i][j] = (float *)malloc(g_nz*sizeof(float));
     }
-    grid = (int ***)malloc(NX*sizeof(int**));
-    for(i = 0; i < NX; i++)
+    grid = (int ***)malloc(g_nx*sizeof(int**));
+    for(i = 0; i < g_nx; i++)
     {
-        grid[i] = (int **)malloc(NY*sizeof(int*));
-        for(j = 0; j < NY; j++)
-            grid[i][j] = (int *)malloc(NZ*sizeof(int));
+        grid[i] = (int **)malloc(g_ny*sizeof(int*));
+        for(j = 0; j < g_ny; j++)
+            grid[i][j] = (int *)malloc(g_nz*sizeof(int));
     }
-    grid1 = (int ***)malloc(NX*sizeof(int**));
-    for(i = 0; i < NX; i++)
+    grid1 = (int ***)malloc(g_nx*sizeof(int**));
+    for(i = 0; i < g_nx; i++)
     {
-        grid1[i] = (int **)malloc(NY*sizeof(int*));
-        for(j = 0; j < NY; j++)
-            grid1[i][j] = (int *)malloc(NZ*sizeof(int));
+        grid1[i] = (int **)malloc(g_ny*sizeof(int*));
+        for(j = 0; j < g_ny; j++)
+            grid1[i][j] = (int *)malloc(g_nz*sizeof(int));
     }
-    grid2 = (int ***)malloc(NX*sizeof(int**));
-    for(i = 0; i < NX; i++)
+    grid2 = (int ***)malloc(g_nx*sizeof(int**));
+    for(i = 0; i < g_nx; i++)
     {
-        grid2[i] = (int **)malloc(NY*sizeof(int*));
-        for(j = 0; j < NY; j++)
-            grid2[i][j] = (int *)malloc(NZ*sizeof(int));
+        grid2[i] = (int **)malloc(g_ny*sizeof(int*));
+        for(j = 0; j < g_ny; j++)
+            grid2[i][j] = (int *)malloc(g_nz*sizeof(int));
     }
-    grid3 = (int ***)malloc(NX*sizeof(int**));
-    for(i = 0; i < NX; i++)
+    grid3 = (int ***)malloc(g_nx*sizeof(int**));
+    for(i = 0; i < g_nx; i++)
     {
-        grid3[i] = (int **)malloc(NY*sizeof(int*));
-        for(j = 0; j < NY; j++)
-            grid3[i][j] = (int *)malloc(NZ*sizeof(int));
+        grid3[i] = (int **)malloc(g_ny*sizeof(int*));
+        for(j = 0; j < g_ny; j++)
+            grid3[i][j] = (int *)malloc(g_nz*sizeof(int));
     }
-    grid4 = (int ***)malloc(NX*sizeof(int**));
-    for(i = 0; i < NX; i++)
+    grid4 = (int ***)malloc(g_nx*sizeof(int**));
+    for(i = 0; i < g_nx; i++)
     {
-        grid4[i] = (int **)malloc(NY*sizeof(int*));
-        for(j = 0; j < NY; j++)
-            grid4[i][j] = (int *)malloc(NZ*sizeof(int));
+        grid4[i] = (int **)malloc(g_ny*sizeof(int*));
+        for(j = 0; j < g_ny; j++)
+            grid4[i][j] = (int *)malloc(g_nz*sizeof(int));
     }
 
 	for(i=0;i<max_ele_no;i++)
@@ -1727,7 +1779,7 @@ int main (int argc, const char * argv[]) {
         x[i] = y[i] = z[i] = 0.0f;
         id[i] = ele_type[i] = 0;
     }
-    for(i = 0; i < MAX_CELL; i++)
+    for(i = 0; i < g_max_cell; i++)
     {
         ele_per_cell[i] = 0;
         cell_type[i] = 0;

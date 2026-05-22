@@ -7,5 +7,5 @@
 #SBATCH --partition=gpu --gres=gpu
 
 module load compiler/gcc/9 cuda/12.2
-gcc -O2 -o cancer main.c -lOpenCL -lm
-./cancer
+make
+./aa
