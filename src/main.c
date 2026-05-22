@@ -1696,7 +1696,7 @@ int main (int argc, const char * argv[]) {
     g_nbx = (int)ceilf(g_lx / BIN_SIZE);
     g_nby = (int)ceilf(g_ly / BIN_SIZE);
     g_nbz = (int)ceilf(g_lz / BIN_SIZE);
-    g_nbins = g_nbx * g_nby * g_nbx;
+    g_nbins = g_nbx * g_nby * g_nbz;
     
     g_max_cell = (int)(sniff_cell_no * CELL_GROWTH);
 
