@@ -8,4 +8,6 @@
 
 module load compiler/gcc/9 cuda/12.2
 make
-./aa
+for ic in Input/*; do
+    (time ./aa.exe "$ic" >> results.txt)
+done
