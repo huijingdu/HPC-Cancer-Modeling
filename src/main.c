@@ -108,7 +108,7 @@ void sniff_ic(const char InName[], int *cell_no_out, float *mx_out, float *my_ou
             fscanf(fp, "%f %f %f", &px, &py, &pz);
             if (px > mx) mx = px;
             if (py > my) my = py;
-            if (pz > pz) mz = py;
+            if (pz > mz) mz = pz;
         }
         actual++;
     }
