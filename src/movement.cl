@@ -132,12 +132,12 @@ __const float lz,
 __const int max_ele,
 __global int * cell_type,
 __global int * flag_gener,
-__const int nbx,
-__const int nby, 
-__const int nbz,
-__const float bin_size,
+__global const int * cell_list,
 __global const int * bin_offset,
-__global const int * sorted_ids)
+__const float inter_dist,
+__const int bins_x,
+__const int bins_y,
+__const int bins_z)
 {
     int gId = get_global_id(0); //get the global ID of this work unit.
     int cellId = gId/max_ele;
@@ -145,62 +145,82 @@ __global const int * sorted_ids)
     if(cellId >= cell_no || eleId >= ele_per_cell[cellId]) return;
     if(ele_per_cell[cellId] == 0) return;
 
+    int i, j, k;
     float x_F1 = 0.0f, y_F1 = 0.0f, z_F1 = 0.0f;
     float r, V;
     float x_dist, y_dist, z_dist;
-    
-    int my_bx = (int)floor(x[gId] / bin_size);
-    int my_by = (int)floor(y[gId] / bin_size);
-    int my_bz = (int)floor(z[gId] / bin_size);
+
+    // intra-cell interactions (same cell, no bins, no cutoff)
+    for (j = 0; j < ele_per_cell[cellId]; ++j) {
+        i = cellId * max_ele + j;
+        if (i == gId) continue;
+        x_dist = x[gId] - x[i];
+        y_dist = y[gId] - y[i];
+        z_dist = z[gId] - z[i];
+        r = distance3_new(x_dist, y_dist, z_dist);
+        V = intra_potential(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
+        x_F1 += V * x_dist;
+        y_F1 += V * y_dist;
+        z_F1 += V * z_dist;
+    }
+
+    // inter-cell interactions, sweeping the 27-bin neighborhood of cell centers
+    int my_bx = (int)floor(xc[cellId] / inter_dist);
+    int my_by = (int)floor(yc[cellId] / inter_dist);
+    int my_bz = (int)floor(zc[cellId] / inter_dist);
     if (my_bx < 0) my_bx = 0;
     if (my_by < 0) my_by = 0;
     if (my_bz < 0) my_bz = 0;
-    if (my_bx >= nbx) my_bx = nbx - 1;
-    if (my_by >= nby) my_by = nby - 1;
-    if (my_bz >= nbz) my_bz = nbz - 1; 
-    
+    if (my_bx >= bins_x) my_bx = bins_x - 1;
+    if (my_by >= bins_y) my_by = bins_y - 1;
+    if (my_bz >= bins_z) my_bz = bins_z - 1;
+
     for (int dz = -1; dz <= 1; ++dz) {
         int nz = my_bz + dz;
-        if (nz < 0 || nz >= nbz) continue;
-        
+        if (nz < 0 || nz >= bins_z) continue;
+
         for (int dy = -1; dy <= 1; ++dy) {
-            int ny_raw = my_by + dy;
-            int ny = (ny_raw + nby) % nby;
-            float y_shift = 0.0f;
-            if (ny_raw < 0) {
-                y_shift = -ly;
-            } else if (ny_raw >= nby) {
-                y_shift = ly;
-            }
-           
-            for (int dx = -1; dx <= 1; ++dx) { 
-                int nx_raw = my_bx + dx;
-                int nx = (nx_raw + nbx) % nbx;
-                float x_shift = 0.0f;
-                if (nx_raw < 0) {
-                    x_shift = -lx;
-                } else if (nx_raw >= nbx) {
-                    x_shift = lx;
-                }
-                
-                int nbin = nx + ny * nbx + nz * nbx * nby;
+            int ny = (my_by + dy + bins_y) % bins_y;
+
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = (my_bx + dx + bins_x) % bins_x;
+
+                int nbin = nx + ny * bins_x + nz * bins_x * bins_y;
                 int start = bin_offset[nbin];
                 int end = bin_offset[nbin + 1];
-                
-                for (int p = start; p < end; ++p) {
-                    int i = sorted_ids[p];
-                    if (i == gId) continue;
-                    
-                    x_dist = x[gId] - (x[i] + x_shift);
-                    y_dist = y[gId] - (y[i] + y_shift);
-                    z_dist = z[gId] - z[i];
-                    r = distance3_new(x_dist, y_dist, z_dist);
-                    
 
-                    if (id[gId] == id[i]) {
-                        V = intra_potential(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
-                    } else {
-                        int k = i / max_ele;
+                for (int p = start; p < end; ++p) {
+                    k = cell_list[p];
+                    if (k == cellId) continue; // same-cell handled by the intra loop
+
+                    // cell-cell cull: reject the whole 20x20 element block cheaply
+                    float dist = 20.0f;
+                    x_dist = fabs(xc[cellId] - xc[k]);
+                    if (x_dist > dist && lx - x_dist > dist) continue;
+                    y_dist = fabs(yc[cellId] - yc[k]);
+                    if (y_dist > dist && ly - y_dist > dist) continue;
+
+                    float x_shift = 0.0f;
+                    if (x_dist > (lx - x_dist)) {
+                        x_dist = lx - x_dist;
+                        x_shift = (xc[k] > xc[cellId]) ? -lx : lx;
+                    }
+                    float y_shift = 0.0f;
+                    if (y_dist > (ly - y_dist)) {
+                        y_dist = ly - y_dist;
+                        y_shift = (yc[k] > yc[cellId]) ? -ly : ly;
+                    }
+                    z_dist = fabs(zc[cellId] - zc[k]);
+                    if (distance3_new(x_dist, y_dist, z_dist) > dist) continue;
+
+                    for (j = 0; j < ele_per_cell[k]; ++j) {
+                        i = k * max_ele + j;
+                        x_dist = x[gId] - (x[i] + x_shift);
+                        y_dist = y[gId] - (y[i] + y_shift);
+                        z_dist = z[gId] - z[i];
+                        r = distance3_new(x_dist, y_dist, z_dist);
+                        if (r >= 12.0f) continue; // inter potentials are 0 past 12
+
                         if (cell_type[cellId] == cell_type[k]) {
                             V = inter_potential_same(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
                         } else if ((cell_type[cellId] + cell_type[k]) == 3) {
@@ -208,10 +228,10 @@ __global const int * sorted_ids)
                         } else {
                             V = inter_potential(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
                         }
+                        x_F1 += V * x_dist;
+                        y_F1 += V * y_dist;
+                        z_F1 += V * z_dist;
                     }
-                    x_F1 += V * x_dist;
-                    y_F1 += V * y_dist;
-                    z_F1 += V * z_dist;
                 }
             }
         }

@@ -308,11 +308,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     float * zo = (float *)malloc(max_ele_no*sizeof(float));
 
     // Bin realated declarations
-    int * bin_id_host = (int *)malloc(max_ele_no * sizeof(int));
     int * bin_count_host = (int *)malloc(g_nbins * sizeof(int));
     int * bin_offset_host = (int *)malloc((g_nbins + 1) * sizeof(int));
-    int * bin_pos_host = (int *)malloc(g_nbins * sizeof(int));
-    int * sorted_ids_host = (int *)malloc(max_ele_no * sizeof(int));
+    int * cell_list_host = (int *)malloc(g_max_cell * sizeof(int));
 
 
     srand(time(NULL));
@@ -353,7 +351,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     cl_mem xo_mem, yo_mem, zo_mem;
 
     // Bin related declarations (buffers created below, after context exists)
-    cl_mem bin_id_mem, bin_count_mem, bin_offset_mem, bin_pos_mem, sorted_ids_mem;
+    cl_mem bin_count_mem, bin_offset_mem, cell_list_mem;
 
     // Get platform and device information
     cl_platform_id *platform_id = NULL;
@@ -416,11 +414,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 	}
 
     // Bin buffer allocation (requires context)
-    bin_id_mem     = clCreateBuffer(context, CL_MEM_READ_WRITE, max_ele_no * sizeof(int), NULL, &err);
-    bin_count_mem  = clCreateBuffer(context, CL_MEM_READ_WRITE, g_nbins * sizeof(int), NULL, &err);
+    bin_count_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, g_nbins * sizeof(int), NULL, &err);
     bin_offset_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, (g_nbins + 1) * sizeof(int), NULL, &err);
-    bin_pos_mem    = clCreateBuffer(context, CL_MEM_READ_WRITE, g_nbins * sizeof(int), NULL, &err);
-    sorted_ids_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, max_ele_no * sizeof(int), NULL, &err);
+    cell_list_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, g_max_cell * sizeof(int), NULL, &err);
     assert(err == CL_SUCCESS);
 	
 #pragma mark Program and Kernel Creation
@@ -540,13 +536,11 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         char build[2048] = {0};
         clGetProgramBuildInfo(program[8], device_id, CL_PROGRAM_BUILD_LOG, sizeof(build), build, NULL);
 
-        kernel[8] = clCreateKernel(program[8], "bin_assign", &err);
+        kernel[8] = clCreateKernel(program[8], "bin_count", &err);
         assert(err == CL_SUCCESS);
-        kernel[9] = clCreateKernel(program[8], "bin_histogram", &err);
+        kernel[9] = clCreateKernel(program[8], "bin_prefix_sum", &err);
         assert(err == CL_SUCCESS);
-        kernel[10] = clCreateKernel(program[8], "bin_prefix_sum", &err);
-        assert(err == CL_SUCCESS);
-        kernel[11] = clCreateKernel(program[8], "bin_scatter", &err);
+        kernel[10] = clCreateKernel(program[8], "bin_scatter", &err);
         assert(err == CL_SUCCESS);
     }
 
@@ -807,49 +801,46 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     {
         const float bin_size_f = BIN_SIZE;
         const int nbx_i = g_nbx, nby_i = g_nby, nbz_i = g_nbz, nbins_i = g_nbins;
-        const int max_ele_i = MAX_ELE;
 
-        // kernel[8] bin_assign
-        err = clSetKernelArg(kernel[8], 0, sizeof(cl_mem), &x_mem);
-        err |= clSetKernelArg(kernel[8], 1, sizeof(cl_mem), &y_mem);
-        err |= clSetKernelArg(kernel[8], 2, sizeof(cl_mem), &z_mem);
+        // kernel[8] bin_count
+        err = clSetKernelArg(kernel[8], 0, sizeof(cl_mem), &xc_mem);
+        err |= clSetKernelArg(kernel[8], 1, sizeof(cl_mem), &yc_mem);
+        err |= clSetKernelArg(kernel[8], 2, sizeof(cl_mem), &zc_mem);
         err |= clSetKernelArg(kernel[8], 3, sizeof(cl_mem), &ele_per_cell_mem);
-        err |= clSetKernelArg(kernel[8], 4, sizeof(int), &max_ele_i);
-        
-        // arg 5 (cell_no) set per step
-        err |= clSetKernelArg(kernel[8], 6, sizeof(float), &bin_size_f);
-        err |= clSetKernelArg(kernel[8], 7, sizeof(int), &nbx_i);
-        err |= clSetKernelArg(kernel[8], 8, sizeof(int), &nby_i); 
-        err |= clSetKernelArg(kernel[8], 9, sizeof(int), &nbz_i);
-        err |= clSetKernelArg(kernel[8], 10, sizeof(int), &nbins_i);
-        err |= clSetKernelArg(kernel[8], 11, sizeof(cl_mem), &bin_id_mem);  
+        // arg 4 (cell_no) set per step
+        err |= clSetKernelArg(kernel[8], 5, sizeof(float), &bin_size_f);
+        err |= clSetKernelArg(kernel[8], 6, sizeof(int), &nbx_i);
+        err |= clSetKernelArg(kernel[8], 7, sizeof(int), &nby_i);
+        err |= clSetKernelArg(kernel[8], 8, sizeof(int), &nbz_i);
+        err |= clSetKernelArg(kernel[8], 9, sizeof(cl_mem), &bin_count_mem);
 
-        // kernel[9] bin_histogram
-        err |= clSetKernelArg(kernel[9], 0, sizeof(cl_mem), &bin_id_mem);
+        // kernel[9] bin_prefix_sum
+        err |= clSetKernelArg(kernel[9], 0, sizeof(cl_mem), &bin_count_mem);
         err |= clSetKernelArg(kernel[9], 1, sizeof(int), &nbins_i);
-        err |= clSetKernelArg(kernel[9], 2, sizeof(cl_mem), &bin_count_mem);
+        err |= clSetKernelArg(kernel[9], 2, sizeof(cl_mem), &bin_offset_mem);
 
-        // kernel[10] bin_prefix_sum
-        err |= clSetKernelArg(kernel[10], 0, sizeof(cl_mem), &bin_count_mem);
-        err |= clSetKernelArg(kernel[10], 1, sizeof(int), &nbins_i);
-        err |= clSetKernelArg(kernel[10], 2, sizeof(cl_mem), &bin_offset_mem);
+        // kernel[10] bin_scatter
+        err |= clSetKernelArg(kernel[10], 0, sizeof(cl_mem), &xc_mem);
+        err |= clSetKernelArg(kernel[10], 1, sizeof(cl_mem), &yc_mem);
+        err |= clSetKernelArg(kernel[10], 2, sizeof(cl_mem), &zc_mem);
+        err |= clSetKernelArg(kernel[10], 3, sizeof(cl_mem), &ele_per_cell_mem);
+        // arg 4 (cell_no) set per step
+        err |= clSetKernelArg(kernel[10], 5, sizeof(float), &bin_size_f);
+        err |= clSetKernelArg(kernel[10], 6, sizeof(int), &nbx_i);
+        err |= clSetKernelArg(kernel[10], 7, sizeof(int), &nby_i);
+        err |= clSetKernelArg(kernel[10], 8, sizeof(int), &nbz_i);
+        err |= clSetKernelArg(kernel[10], 9, sizeof(cl_mem), &bin_count_mem);
+        err |= clSetKernelArg(kernel[10], 10, sizeof(cl_mem), &cell_list_mem);
 
-        // kernel[11] bin_scatter
-        err |= clSetKernelArg(kernel[11], 0, sizeof(cl_mem), &bin_id_mem);
-        err |= clSetKernelArg(kernel[11], 1, sizeof(cl_mem), &bin_offset_mem);
-        err |= clSetKernelArg(kernel[11], 2, sizeof(int), &nbins_i);
-        err |= clSetKernelArg(kernel[11], 3, sizeof(cl_mem), &bin_pos_mem);
-        err |= clSetKernelArg(kernel[11], 4, sizeof(cl_mem), &sorted_ids_mem);
-        
         assert(err == CL_SUCCESS);
 
         // Bin related arguments
-        err = clSetKernelArg(kernel[0], 21, sizeof(int), &nbx_i);
-        err |= clSetKernelArg(kernel[0], 22, sizeof(int), &nby_i);
-        err |= clSetKernelArg(kernel[0], 23, sizeof(int), &nbz_i);
-        err |= clSetKernelArg(kernel[0], 24, sizeof(float), &bin_size_f);
-        err |= clSetKernelArg(kernel[0], 25, sizeof(cl_mem), &bin_offset_mem);
-        err |= clSetKernelArg(kernel[0], 26, sizeof(cl_mem), &sorted_ids_mem);
+        err = clSetKernelArg(kernel[0], 21, sizeof(cl_mem), &cell_list_mem);
+        err |= clSetKernelArg(kernel[0], 22, sizeof(cl_mem), &bin_offset_mem);
+        err |= clSetKernelArg(kernel[0], 23, sizeof(float), &bin_size_f);
+        err |= clSetKernelArg(kernel[0], 24, sizeof(int), &nbx_i);
+        err |= clSetKernelArg(kernel[0], 25, sizeof(int), &nby_i);
+        err |= clSetKernelArg(kernel[0], 26, sizeof(int), &nbz_i);
         assert(err == CL_SUCCESS);
     }
 
@@ -992,22 +983,20 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
         } // end of cell updates
 #endif
-        size_t bin_global = cell_no * MAX_ELE;
+        size_t gws_cells = cell_no;
         size_t one = 1;
         int zero_int = 0;
-        
-        err = clSetKernelArg(kernel[8], 5, sizeof(int), &cell_no); // bin_assign cell_no
-        
-        // zero histogram and write cursor
+
+        err = clSetKernelArg(kernel[8], 4, sizeof(int), &cell_no); // bin_count cell_no
+        err |= clSetKernelArg(kernel[10], 4, sizeof(int), &cell_no); // bin_scatter cell_no
+
+        // zero per-bin counter (reused as the scatter cursor after the prefix sum)
         err |= clEnqueueFillBuffer(cmd_queue, bin_count_mem, &zero_int, sizeof(int),
                                     0, g_nbins * sizeof(int), 0, NULL, NULL);
-        err |= clEnqueueFillBuffer(cmd_queue, bin_pos_mem, &zero_int, sizeof(int),
-                                    0, g_nbins * sizeof(int), 0, NULL, NULL);
 
-        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[8], 1, NULL, &bin_global, NULL, 0, NULL, NULL);
-        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[9], 1, NULL, &bin_global, NULL, 0, NULL, NULL);
-        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[10], 1, NULL, &one, NULL, 0, NULL, NULL);
-        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[11], 1, NULL, &bin_global, NULL, 0, NULL, NULL);
+        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[8], 1, NULL, &gws_cells, NULL, 0, NULL, NULL);
+        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[9], 1, NULL, &one, NULL, 0, NULL, NULL);
+        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[10], 1, NULL, &gws_cells, NULL, 0, NULL, NULL);
         assert(err == CL_SUCCESS);
 
         // cell movement
