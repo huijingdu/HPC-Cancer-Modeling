@@ -1560,7 +1560,7 @@ int main (int argc, const char * argv[]) {
 
     int i, j, k;
    
-    char InName[] = "Input/IC_10K";
+    const char * InName = argv[1];
     int sniff_cell_no;
     float mx, my, mz;
     sniff_ic(InName, &sniff_cell_no, &mx, &my, &mz);
