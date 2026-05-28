@@ -13,7 +13,13 @@ __global float * chem2,
 __global float * o1,
 __global float * o2,
 __const int max_ele,
-__global int * cell_type)
+__global int * cell_type,
+__const int NX,
+__const int NY,
+__const int NZ, 
+__const int LX,
+__const int LY,
+__const int LZ)
 {
     int gId = get_global_id(0); 
     int cellId = gId/max_ele;
@@ -22,12 +28,6 @@ __global int * cell_type)
         return;
     }
 
-    int NX = 40;
-    int NY = NX;
-    int NZ = 80;
-    float LX = 40.0;
-    float LY = LX;
-    float LZ = 80.0;
     float DX = LX/NX;
     float DY = LY/NY;
     float DZ = LZ/NZ;
