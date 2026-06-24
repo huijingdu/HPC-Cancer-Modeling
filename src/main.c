@@ -44,9 +44,9 @@
 
 #define GROWTH_FR 1000
 #define DIVISION_FR 1000
-#define OUTPUT_FR 10000
+#define OUTPUT_FR 100
 
-#define MAX_ITERATIONS 400001
+#define MAX_ITERATIONS 101
 #define MAX_CHEM_ITER  1000
 #define MAX_DEATH 60000
 
@@ -99,6 +99,7 @@ void sniff_ic(const char InName[], int *cell_no_out, float *mx_out, float *my_ou
     float mx = 0.0f, my = 0.0f, mz = 0.0f;
     float px, py, pz, pxc, pyc, pzc;
     int pid, ptype, pele, ptime, pcyc;
+        
 
     for (int i = 0; i < temp_cell_no; i++) {
         fscanf(fp, "%d %d %d %f %f %f %d %d\n",
@@ -1661,6 +1662,38 @@ void  cell_lineage(int id, float x, float y, float z, int ctype0, int * ctype1, 
     }
 }
 
+void verifyDomain(float * x, float * y, float * z, int max_ele_no,
+                  float g_lx, float g_ly, float g_lz) {
+    int i;
+    int num_crossings = 0;
+    for (i = 0; i < max_ele_no; ++i) {
+        if (x[i] > g_lx) {
+            num_crossings += 1;
+        } 
+    }
+    if (num_crossings) {
+        fprintf(stderr, "WARNING %d elements outside x boundary\n", num_crossings);
+    }
+    num_crossings = 0;
+    for (i = 0; i < max_ele_no; ++i) {
+        if (y[i] > g_ly) {
+            num_crossings += 1;
+        } 
+    }
+    if (num_crossings) {
+        fprintf(stderr, "WARNING %d elements outside y boundary\n", num_crossings);
+    }
+    num_crossings = 0;
+    for (i = 0; i < max_ele_no; ++i) {
+        if (z[i] > g_lz) {
+            num_crossings += 1;
+        } 
+    }
+    if (num_crossings) {
+        fprintf(stderr, "WARNING %d elements outside z boundary\n", num_crossings);
+    }
+}
+
 
 int main (int argc, const char * argv[]) {
 
@@ -1671,9 +1704,9 @@ int main (int argc, const char * argv[]) {
     float mx, my, mz;
     sniff_ic(InName, &sniff_cell_no, &mx, &my, &mz);
 
-    g_lx = mx + PAD;
-    g_ly = my + PAD;
-    g_lz = mz + PAD;
+    g_lx = mx * 1.75 + 10.0f;
+    g_ly = my * 1.75 + 10.0f;
+    g_lz = mz * 1.15 + 10.0f;
 
     g_nx = (int)ceilf(g_lx / g_dx_TARGET);
     g_ny = (int)ceilf(g_ly / g_dx_TARGET);
@@ -1784,6 +1817,9 @@ int main (int argc, const char * argv[]) {
           max_ele_no, 
           ele_no, cell_no, ele_per_cell,
           cclock, cycle);
+    
+    // Verify if the cells remained within the domain
+    verifyDomain(x, y, z, max_ele_no, g_lx, g_ly, g_lz);
 
     // Free up memory
     free(x);
