@@ -33,7 +33,8 @@
 #endif
 #endif
 
-#define DX_TARGET 1.0f
+#define BIN_SIZE 12.0f
+#define g_dx_TARGET 1.0f
 #define PAD 5.0f
 #define CELL_GROWTH 2.0f
 #define MAX_ELE 20
@@ -43,9 +44,9 @@
 
 #define GROWTH_FR 1000
 #define DIVISION_FR 1000
-#define OUTPUT_FR 10000
+#define OUTPUT_FR 100
 
-#define MAX_ITERATIONS 400001
+#define MAX_ITERATIONS 101
 #define MAX_CHEM_ITER  1000
 #define MAX_DEATH 60000
 
@@ -56,6 +57,7 @@
 #define MAX_GENER 2
 
 static int g_nx, g_ny, g_nz;
+static int g_nbx, g_nby, g_nbz, g_nbins;
 static int g_max_cell;
 static float g_lx, g_ly, g_lz;
 static float g_dx, g_dy, g_dz;
@@ -106,7 +108,7 @@ void sniff_ic(const char InName[], int *cell_no_out, float *mx_out, float *my_ou
             fscanf(fp, "%f %f %f", &px, &py, &pz);
             if (px > mx) mx = px;
             if (py > my) my = py;
-            if (pz > pz) mz = py;
+            if (pz > mz) mz = pz;
         }
         actual++;
     }
@@ -267,7 +269,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 {
     int flag_print = 0;
     cl_program program[10], program1;
-    cl_kernel kernel[10], kernel1;
+    cl_kernel kernel[12], kernel1;
 	
     cl_command_queue cmd_queue;
     cl_context   context;
@@ -305,6 +307,12 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     float * yo = (float *)malloc(max_ele_no*sizeof(float));
     float * zo = (float *)malloc(max_ele_no*sizeof(float));
 
+    // Bin realated declarations
+    int * bin_count_host = (int *)malloc(g_nbins * sizeof(int));
+    int * bin_offset_host = (int *)malloc((g_nbins + 1) * sizeof(int));
+    int * cell_list_host = (int *)malloc(g_max_cell * sizeof(int));
+
+
     srand(time(NULL));
 
     for(int i = 0; i < max_ele_no; i++)
@@ -341,6 +349,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     cl_mem o1_mem, o2_mem;
     cl_mem vx_mem, vy_mem, vz_mem;
     cl_mem xo_mem, yo_mem, zo_mem;
+
+    // Bin related declarations (buffers created below, after context exists)
+    cl_mem bin_count_mem, bin_offset_mem, cell_list_mem;
 
     // Get platform and device information
     cl_platform_id *platform_id = NULL;
@@ -402,6 +413,12 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     	cmd_queue = clCreateCommandQueueWithProperties(context, device_id, 0, NULL);
 	}
 
+    // Bin buffer allocation (requires context)
+    bin_count_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, g_nbins * sizeof(int), NULL, &err);
+    bin_offset_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, (g_nbins + 1) * sizeof(int), NULL, &err);
+    cell_list_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, g_max_cell * sizeof(int), NULL, &err);
+    assert(err == CL_SUCCESS);
+	
 #pragma mark Program and Kernel Creation
 	{
         // create program for cell movement
@@ -505,6 +522,26 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         size_t workgroup_size;
         err = clGetKernelWorkGroupInfo(kernel[7], device, CL_KERNEL_WORK_GROUP_SIZE,
                                 sizeof(size_t), &workgroup_size, NULL);
+    }
+    
+    {
+        // create program for binning logic
+        const char * filename = "binning.cl";
+        char *program_source = load_program_source(filename);
+        
+        program[8] = clCreateProgramWithSource(context, 1, (const char**)&program_source, NULL, &err);
+        assert(err == CL_SUCCESS);
+        err = clBuildProgram(program[8], 0, NULL, NULL, NULL, NULL);
+
+        char build[2048] = {0};
+        clGetProgramBuildInfo(program[8], device_id, CL_PROGRAM_BUILD_LOG, sizeof(build), build, NULL);
+
+        kernel[8] = clCreateKernel(program[8], "bin_count", &err);
+        assert(err == CL_SUCCESS);
+        kernel[9] = clCreateKernel(program[8], "bin_prefix_sum", &err);
+        assert(err == CL_SUCCESS);
+        kernel[10] = clCreateKernel(program[8], "bin_scatter", &err);
+        assert(err == CL_SUCCESS);
     }
 
 
@@ -667,6 +704,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     	err |= clSetKernelArg(kernel[0], 19, sizeof(cl_mem), &cell_type_mem);
         err |= clSetKernelArg(kernel[0], 20, sizeof(cl_mem), &flag_gener_mem);
     	assert(err == CL_SUCCESS);
+
 	}
 	
 	{
@@ -740,6 +778,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         int max_ele = MAX_ELE;
         // Now setup the arguments to kernel "ovol_fun"
         err  = clSetKernelArg(kernel[7],  0, sizeof(cl_mem), &id_mem);
+        assert(err == CL_SUCCESS);
         err |= clSetKernelArg(kernel[7],  1, sizeof(cl_mem), &x_mem);
         err |= clSetKernelArg(kernel[7],  2, sizeof(cl_mem), &y_mem);
         err |= clSetKernelArg(kernel[7],  3, sizeof(cl_mem), &z_mem);
@@ -750,6 +789,58 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         err |= clSetKernelArg(kernel[7],  8, sizeof(cl_mem), &o2_mem);
         err |= clSetKernelArg(kernel[7],  9, sizeof(int), &max_ele);
         err |= clSetKernelArg(kernel[7], 10, sizeof(cl_mem), &cell_type_mem);
+        err |= clSetKernelArg(kernel[7], 11, sizeof(int), &g_nx);
+        err |= clSetKernelArg(kernel[7], 12, sizeof(int), &g_ny);
+        err |= clSetKernelArg(kernel[7], 13, sizeof(int), &g_nz);
+        err |= clSetKernelArg(kernel[7], 14, sizeof(float), &g_lx);
+        err |= clSetKernelArg(kernel[7], 15, sizeof(float), &g_ly);
+        err |= clSetKernelArg(kernel[7], 16, sizeof(float), &g_lz);
+        assert(err == CL_SUCCESS);
+    }
+    
+    {
+        const float bin_size_f = BIN_SIZE;
+        const int nbx_i = g_nbx, nby_i = g_nby, nbz_i = g_nbz, nbins_i = g_nbins;
+
+        // kernel[8] bin_count
+        err = clSetKernelArg(kernel[8], 0, sizeof(cl_mem), &xc_mem);
+        err |= clSetKernelArg(kernel[8], 1, sizeof(cl_mem), &yc_mem);
+        err |= clSetKernelArg(kernel[8], 2, sizeof(cl_mem), &zc_mem);
+        err |= clSetKernelArg(kernel[8], 3, sizeof(cl_mem), &ele_per_cell_mem);
+        // arg 4 (cell_no) set per step
+        err |= clSetKernelArg(kernel[8], 5, sizeof(float), &bin_size_f);
+        err |= clSetKernelArg(kernel[8], 6, sizeof(int), &nbx_i);
+        err |= clSetKernelArg(kernel[8], 7, sizeof(int), &nby_i);
+        err |= clSetKernelArg(kernel[8], 8, sizeof(int), &nbz_i);
+        err |= clSetKernelArg(kernel[8], 9, sizeof(cl_mem), &bin_count_mem);
+
+        // kernel[9] bin_prefix_sum
+        err |= clSetKernelArg(kernel[9], 0, sizeof(cl_mem), &bin_count_mem);
+        err |= clSetKernelArg(kernel[9], 1, sizeof(int), &nbins_i);
+        err |= clSetKernelArg(kernel[9], 2, sizeof(cl_mem), &bin_offset_mem);
+
+        // kernel[10] bin_scatter
+        err |= clSetKernelArg(kernel[10], 0, sizeof(cl_mem), &xc_mem);
+        err |= clSetKernelArg(kernel[10], 1, sizeof(cl_mem), &yc_mem);
+        err |= clSetKernelArg(kernel[10], 2, sizeof(cl_mem), &zc_mem);
+        err |= clSetKernelArg(kernel[10], 3, sizeof(cl_mem), &ele_per_cell_mem);
+        // arg 4 (cell_no) set per step
+        err |= clSetKernelArg(kernel[10], 5, sizeof(float), &bin_size_f);
+        err |= clSetKernelArg(kernel[10], 6, sizeof(int), &nbx_i);
+        err |= clSetKernelArg(kernel[10], 7, sizeof(int), &nby_i);
+        err |= clSetKernelArg(kernel[10], 8, sizeof(int), &nbz_i);
+        err |= clSetKernelArg(kernel[10], 9, sizeof(cl_mem), &bin_count_mem);
+        err |= clSetKernelArg(kernel[10], 10, sizeof(cl_mem), &cell_list_mem);
+
+        assert(err == CL_SUCCESS);
+
+        // Bin related arguments
+        err = clSetKernelArg(kernel[0], 21, sizeof(cl_mem), &cell_list_mem);
+        err |= clSetKernelArg(kernel[0], 22, sizeof(cl_mem), &bin_offset_mem);
+        err |= clSetKernelArg(kernel[0], 23, sizeof(float), &bin_size_f);
+        err |= clSetKernelArg(kernel[0], 24, sizeof(int), &nbx_i);
+        err |= clSetKernelArg(kernel[0], 25, sizeof(int), &nby_i);
+        err |= clSetKernelArg(kernel[0], 26, sizeof(int), &nbz_i);
         assert(err == CL_SUCCESS);
     }
 
@@ -892,6 +983,21 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
         } // end of cell updates
 #endif
+        size_t gws_cells = cell_no;
+        size_t one = 1;
+        int zero_int = 0;
+
+        err = clSetKernelArg(kernel[8], 4, sizeof(int), &cell_no); // bin_count cell_no
+        err |= clSetKernelArg(kernel[10], 4, sizeof(int), &cell_no); // bin_scatter cell_no
+
+        // zero per-bin counter (reused as the scatter cursor after the prefix sum)
+        err |= clEnqueueFillBuffer(cmd_queue, bin_count_mem, &zero_int, sizeof(int),
+                                    0, g_nbins * sizeof(int), 0, NULL, NULL);
+
+        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[8], 1, NULL, &gws_cells, NULL, 0, NULL, NULL);
+        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[9], 1, NULL, &one, NULL, 0, NULL, NULL);
+        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[10], 1, NULL, &gws_cells, NULL, 0, NULL, NULL);
+        assert(err == CL_SUCCESS);
 
         // cell movement
         err = clSetKernelArg(kernel[0],  5, sizeof(int), &cell_no);
@@ -1555,6 +1661,38 @@ void  cell_lineage(int id, float x, float y, float z, int ctype0, int * ctype1, 
     }
 }
 
+void verifyDomain(float * x, float * y, float * z, int max_ele_no,
+                  float g_lx, float g_ly, float g_lz) {
+    int i;
+    int num_crossings = 0;
+    for (i = 0; i < max_ele_no; ++i) {
+        if (x[i] > g_lx) {
+            num_crossings += 1;
+        } 
+    }
+    if (num_crossings) {
+        fprintf(stderr, "WARNING %d elements outside x boundary\n", num_crossings);
+    }
+    num_crossings = 0;
+    for (i = 0; i < max_ele_no; ++i) {
+        if (y[i] > g_ly) {
+            num_crossings += 1;
+        } 
+    }
+    if (num_crossings) {
+        fprintf(stderr, "WARNING %d elements outside y boundary\n", num_crossings);
+    }
+    num_crossings = 0;
+    for (i = 0; i < max_ele_no; ++i) {
+        if (z[i] > g_lz) {
+            num_crossings += 1;
+        } 
+    }
+    if (num_crossings) {
+        fprintf(stderr, "WARNING %d elements outside z boundary\n", num_crossings);
+    }
+}
+
 
 int main (int argc, const char * argv[]) {
 
@@ -1565,16 +1703,21 @@ int main (int argc, const char * argv[]) {
     float mx, my, mz;
     sniff_ic(InName, &sniff_cell_no, &mx, &my, &mz);
 
-    g_lx = mx + PAD;
-    g_ly = my + PAD;
-    g_lz = mz + PAD;
+    g_lx = mx * 1.75 + 10.0f;
+    g_ly = my * 1.75 + 10.0f;
+    g_lz = mz * 1.15 + 10.0f;
 
-    g_nx = (int)ceilf(g_lx / DX_TARGET);
-    g_ny = (int)ceilf(g_ly / DX_TARGET);
-    g_nz = (int)ceilf(g_lz / DX_TARGET);
+    g_nx = (int)ceilf(g_lx / g_dx_TARGET);
+    g_ny = (int)ceilf(g_ly / g_dx_TARGET);
+    g_nz = (int)ceilf(g_lz / g_dx_TARGET);
     g_dx = g_lx / g_nx;
     g_dy = g_ly / g_ny;
     g_dz = g_lz / g_nz;
+
+    g_nbx = (int)ceilf(g_lx / BIN_SIZE);
+    g_nby = (int)ceilf(g_ly / BIN_SIZE);
+    g_nbz = (int)ceilf(g_lz / BIN_SIZE);
+    g_nbins = g_nbx * g_nby * g_nbz;
     
     g_max_cell = (int)(sniff_cell_no * CELL_GROWTH);
 
@@ -1673,6 +1816,9 @@ int main (int argc, const char * argv[]) {
           max_ele_no, 
           ele_no, cell_no, ele_per_cell,
           cclock, cycle);
+    
+    // Verify if the cells remained within the domain
+    verifyDomain(x, y, z, max_ele_no, g_lx, g_ly, g_lz);
 
     // Free up memory
     free(x);
