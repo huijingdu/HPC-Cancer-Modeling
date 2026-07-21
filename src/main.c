@@ -34,6 +34,7 @@
 #endif
 
 #define BIN_SIZE 12.0f
+#define HALF_SKIN 1.0f // half the Verlet skin, triggers a lazy cell-list rebuild
 #define g_dx_TARGET 1.0f
 #define PAD 5.0f
 #define CELL_GROWTH 2.0f
@@ -339,6 +340,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
     cl_mem x_mem, y_mem, z_mem;
     cl_mem xc_mem, yc_mem, zc_mem;
+    cl_mem xc_ref_mem, yc_ref_mem, zc_ref_mem, need_rebuild_mem;
     cl_mem id_mem, cell_type_mem, ele_type_mem;
     cl_mem xF_mem, yF_mem, zF_mem;
     cl_mem ele_per_cell_mem;
@@ -545,6 +547,22 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         assert(err == CL_SUCCESS);
     }
 
+    {
+        // create program for the lazy-rebuild displacement check
+        const char * filename = "check_displacement.cl";
+        char *program_source = load_program_source(filename);
+
+        program[9] = clCreateProgramWithSource(context, 1, (const char**)&program_source, NULL, &err);
+        assert(err == CL_SUCCESS);
+        err = clBuildProgram(program[9], 0, NULL, NULL, NULL, NULL);
+
+        char build[2048] = {0};
+        clGetProgramBuildInfo(program[9], device_id, CL_PROGRAM_BUILD_LOG, sizeof(build), build, NULL);
+
+        kernel[11] = clCreateKernel(program[9], "check_displacement", &err);
+        assert(err == CL_SUCCESS);
+    }
+
 
 #pragma mark Memory Allocation
 	{
@@ -624,6 +642,12 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         err |= clEnqueueWriteBuffer(cmd_queue, o2_mem, CL_TRUE, 0, buffer_size,
                                    (void*)OVOL2, 0, NULL, NULL);
     	assert(err == CL_SUCCESS);
+
+        // reference cell centers snapshotted at each rebuild, plus the rebuild flag
+        xc_ref_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, NULL);
+        yc_ref_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, NULL);
+        zc_ref_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, NULL);
+        need_rebuild_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int), NULL, NULL);
 
         buffer_size = sizeof(float) * g_nx*g_ny*g_nz;
         chem1_gpu_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, NULL);
@@ -843,6 +867,20 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         err |= clSetKernelArg(kernel[0], 25, sizeof(int), &nby_i);
         err |= clSetKernelArg(kernel[0], 26, sizeof(int), &nbz_i);
         assert(err == CL_SUCCESS);
+
+        // kernel[11] check_displacement, static args set once here
+        float half_skin = HALF_SKIN;
+        err  = clSetKernelArg(kernel[11], 0, sizeof(cl_mem), &xc_mem);
+        err |= clSetKernelArg(kernel[11], 1, sizeof(cl_mem), &yc_mem);
+        err |= clSetKernelArg(kernel[11], 2, sizeof(cl_mem), &zc_mem);
+        err |= clSetKernelArg(kernel[11], 3, sizeof(cl_mem), &xc_ref_mem);
+        err |= clSetKernelArg(kernel[11], 4, sizeof(cl_mem), &yc_ref_mem);
+        err |= clSetKernelArg(kernel[11], 5, sizeof(cl_mem), &zc_ref_mem);
+        err |= clSetKernelArg(kernel[11], 6, sizeof(cl_mem), &ele_per_cell_mem);
+        err |= clSetKernelArg(kernel[11], 7, sizeof(cl_mem), &need_rebuild_mem);
+        // arg 8 (cell_no) is set per iteration in the loop
+        err |= clSetKernelArg(kernel[11], 9, sizeof(float), &half_skin);
+        assert(err == CL_SUCCESS);
     }
 
 #pragma imark Execution and Read
@@ -889,6 +927,10 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
     // index to note how many empty spots in the cell array due to death
     int no_empty = 0;
+
+    // lazy rebuild bookkeeping: always sort on the first step, then count how often we re-sort
+    int first_iter = 1;
+    int sort_count = 0;
 
     // start of time iterations
     int iterations = MAX_ITERATIONS;
@@ -984,21 +1026,46 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
         } // end of cell updates
 #endif
-        size_t gws_cells = cell_no;
-        size_t one = 1;
-        int zero_int = 0;
+        // lazy cell-list rebuild: sort only when a cell has drifted past HALF_SKIN
+        int do_sort = first_iter;
 
-        err = clSetKernelArg(kernel[8], 4, sizeof(int), &cell_no); // bin_count cell_no
-        err |= clSetKernelArg(kernel[10], 4, sizeof(int), &cell_no); // bin_scatter cell_no
+        if (!do_sort && cell_no > 0) {
+            int zero = 0;
+            err = clEnqueueFillBuffer(cmd_queue, need_rebuild_mem, &zero, sizeof(int),
+                                      0, sizeof(int), 0, NULL, NULL);
+            size_t gws = cell_no;
+            err |= clSetKernelArg(kernel[11], 8, sizeof(int), &cell_no); // check_displacement cell_no
+            err |= clEnqueueNDRangeKernel(cmd_queue, kernel[11], 1, NULL, &gws, NULL, 0, NULL, NULL);
+            err |= clEnqueueReadBuffer(cmd_queue, need_rebuild_mem, CL_TRUE, 0,
+                                       sizeof(int), &do_sort, 0, NULL, NULL);
+            assert(err == CL_SUCCESS);
+        }
 
-        // zero per-bin counter (reused as the scatter cursor after the prefix sum)
-        err |= clEnqueueFillBuffer(cmd_queue, bin_count_mem, &zero_int, sizeof(int),
-                                    0, g_nbins * sizeof(int), 0, NULL, NULL);
+        if (do_sort && cell_no > 0) {
+            first_iter = 0;
+            sort_count++;
 
-        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[8], 1, NULL, &gws_cells, NULL, 0, NULL, NULL);
-        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[9], 1, NULL, &one, NULL, 0, NULL, NULL);
-        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[10], 1, NULL, &gws_cells, NULL, 0, NULL, NULL);
-        assert(err == CL_SUCCESS);
+            size_t gws_cells = cell_no;
+            size_t one = 1;
+            int zero_int = 0;
+
+            err = clSetKernelArg(kernel[8], 4, sizeof(int), &cell_no); // bin_count cell_no
+            err |= clSetKernelArg(kernel[10], 4, sizeof(int), &cell_no); // bin_scatter cell_no
+
+            // zero per-bin counter (reused as the scatter cursor after the prefix sum)
+            err |= clEnqueueFillBuffer(cmd_queue, bin_count_mem, &zero_int, sizeof(int),
+                                        0, g_nbins * sizeof(int), 0, NULL, NULL);
+
+            err |= clEnqueueNDRangeKernel(cmd_queue, kernel[8], 1, NULL, &gws_cells, NULL, 0, NULL, NULL);
+            err |= clEnqueueNDRangeKernel(cmd_queue, kernel[9], 1, NULL, &one, NULL, 0, NULL, NULL);
+            err |= clEnqueueNDRangeKernel(cmd_queue, kernel[10], 1, NULL, &gws_cells, NULL, 0, NULL, NULL);
+
+            // snapshot the current cell centers so the next displacement check has a reference
+            err |= clEnqueueCopyBuffer(cmd_queue, xc_mem, xc_ref_mem, 0, 0, cell_no*sizeof(float), 0, NULL, NULL);
+            err |= clEnqueueCopyBuffer(cmd_queue, yc_mem, yc_ref_mem, 0, 0, cell_no*sizeof(float), 0, NULL, NULL);
+            err |= clEnqueueCopyBuffer(cmd_queue, zc_mem, zc_ref_mem, 0, 0, cell_no*sizeof(float), 0, NULL, NULL);
+            assert(err == CL_SUCCESS);
+        }
 
         // cell movement
         err = clSetKernelArg(kernel[0],  5, sizeof(int), &cell_no);
@@ -1466,6 +1533,10 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             }
         }
     }
+
+    // how often the lazy gate actually re-sorted, versus every-step rebuilds
+    printf("lazy rebuild: sorted %d of %d steps (%.1f%%)\n",
+           sort_count, iterations, 100.0*sort_count/iterations);
 	}
 	
 #pragma mark Teardown
