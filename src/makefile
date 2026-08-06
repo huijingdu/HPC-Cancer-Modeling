@@ -1,7 +1,7 @@
 INCLUDE =       -I. -I/usr/include -I./INCLUDE 
 LIB     =       -L/usr/lib 
 DEBUG   =
-CC      =       gcc
+CC      =       mpicc
 ##CFLAGS  =       $(DEBUG) -ggdb
 CFLAGS  =       -O2
 LDFLAGS =       -lm -std=c99
