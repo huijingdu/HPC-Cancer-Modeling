@@ -426,230 +426,112 @@ void InitialReader(const char InName[], float * x, float * y, float * z, int * i
 }
 
 // Output PQR files for visual in VMD
-void output(float * x, float * y, float * z, float * xc, float * yc, float * zc, int * id, int * cell_type, int * ele_type, int cell_no, int ele_no, int * ele_per_cell, int step, float * chem1_gpu, float * chem2_gpu, int * cclock, int * cycle, int * flag_gener, float * vx, float * vy, float * vz)
-{
-    int i, j, k, check, index;
-    char filename[50], outdir[50];
-    FILE *fp = NULL;
+// Every rank formats and writes its own cells
+static double g_output_io = 0.0;
+static double g_output_comm = 0.0;
 
-    int e;
-    struct stat st;
-
-    sprintf(outdir, "%s", "PQR");
-
-    e = stat(outdir, &st);
-
-    if(stat(outdir, &st) == -1)
-    {
-        if(errno == ENOENT)
-        {
-        check = MKDIR(outdir);
-        if(check != 0)
-        {
-        (void) printf("WARNING in output(), directory "
-                     "%s doesn't exist and can't be created\n",outdir);
-        }
-        else
-        {
-            printf("created the dirctory %s\n", outdir);
-        }
-        }
-    }
-
-    sprintf(filename, "%s/data.%d.pqr", outdir, step);
-
-    fp = fopen(filename, "w");
-    if(fp == NULL)
-    {
-        printf("Failed to open file for writing\n");
-        exit(-1);
-    }
-
-    int id_skip = 0;
-    int flag_skip = 0;
-    for(i=0;i<cell_no;i++)
-    {
-        if(ele_per_cell[i] == 0) continue;
-        flag_skip = 0;
-        for(j=0;j<ele_per_cell[i];j++)
-        {
-            k = i*MAX_ELE+j;
-
-            if(z[k] > g_lz+2.0)
-                flag_skip = 1;;
-        }
-        if(flag_skip == 1) continue;
-
-        id_skip = cell_type[i];
-        for(j=0;j<ele_per_cell[i];j++)
-        {
-            k = i*MAX_ELE+j;
-
-            // written in the input frame, not the shifted one
-            fprintf(fp, "ATOM %6d C  THR   %5d      % .3f % .3f % .3f % .4f % .4f\n",
-                    k+1, id[k]+id_skip*1000,
-                    x[k] - g_shift_x, y[k] - g_shift_y, z[k] - g_shift_z,
-                    0.1*ele_type[k], 1.5);
-        }
-    }
-    fclose(fp);
-}
-
-// Gather every rank's cells onto rank 0 and write one PQR
 void output_mpi(float * x, float * y, float * z, float * xc, float * yc, float * zc, int * id, int * cell_type, int * ele_type, int cell_no, int ele_no, int * ele_per_cell, int step, float * chem1_gpu, float * chem2_gpu, int * cclock, int * cycle, int * flag_gener, float * vx, float * vy, float * vz)
 {
-    if (g_nprocs == 1)
-    {
-        output(x, y, z, xc, yc, zc, id, cell_type, ele_type, cell_no, ele_no, ele_per_cell, step, chem1_gpu, chem2_gpu, cclock, cycle, flag_gener, vx, vy, vz);
-        return;
-    }
+    // the cells this rank writes
+    int * out = (int *)malloc((cell_no > 0 ? cell_no : 1) * sizeof(int));
+    assert(out);
+    int my_cells = 0, my_ele = 0;
 
-    // pick the cells this rank contributes: live, and not escaped past the z lid
-    int * out_cells = (int *)malloc((cell_no > 0 ? cell_no : 1) * sizeof(int));
-    int n_out_cells = 0;
-    int n_out_ele = 0;
     for (int i = 0; i < cell_no; i++)
     {
-        int n = ele_per_cell[i];
-        if (n == 0) continue;
+        if (ele_per_cell[i] == 0) continue;
 
         int skip = 0;
-        for (int j = 0; j < n; j++)
+        for (int j = 0; j < ele_per_cell[i]; j++)
             if (z[i * MAX_ELE + j] > g_lz + 2.0) skip = 1;
         if (skip) continue;
 
-        out_cells[n_out_cells++] = i;
-        n_out_ele += n;
+        out[my_cells++] = i;
+        my_ele += ele_per_cell[i];
     }
 
-    // pack 2 ints per cell, then 3 floats and 1 int per element
-    int * send_meta = (int *)malloc((n_out_cells > 0 ? 2 * n_out_cells : 1) * sizeof(int));
-    float * send_coord = (float *)malloc((n_out_ele > 0 ? 3 * n_out_ele : 1) * sizeof(float));
-    int * send_etype = (int *)malloc((n_out_ele > 0 ? n_out_ele : 1) * sizeof(int));
+    double t0 = MPI_Wtime();
+    long long mine[2] = { my_cells, my_ele };
+    long long base[2] = { 0, 0 };
+    MPI_Exscan(mine, base, 2, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+    if (g_rank == 0) base[0] = base[1] = 0;
+    g_output_comm += MPI_Wtime() - t0;
 
-    int coord_pos = 0, etype_pos = 0;
-    for (int s = 0; s < n_out_cells; s++)
+    int gcell = (int)base[0];
+    int gatom = (int)base[1];
+
+    // format into a local buffer, about 96 bytes an ATOM line
+    t0 = MPI_Wtime();
+    size_t cap = (size_t)my_ele * 96 + 1024;
+    char * buf = (char *)malloc(cap);
+    assert(buf);
+    size_t n = 0;
+
+    for (int s = 0; s < my_cells; s++)
     {
-        int i = out_cells[s];
-        int n = ele_per_cell[i];
-        send_meta[2 * s + 0] = n;
-        send_meta[2 * s + 1] = cell_type[i];
-        for (int j = 0; j < n; j++)
+        int i = out[s];
+        for (int j = 0; j < ele_per_cell[i]; j++)
         {
             int k = i * MAX_ELE + j;
-            send_coord[coord_pos++] = x[k];
-            send_coord[coord_pos++] = y[k];
-            send_coord[coord_pos++] = z[k];
-            send_etype[etype_pos++] = ele_type[k];
-        }
-    }
-    free(out_cells);
-
-    int * cell_counts = NULL;
-    int * ele_counts = NULL;
-    if (g_rank == 0)
-    {
-        cell_counts = (int *)malloc(g_nprocs * sizeof(int));
-        ele_counts = (int *)malloc(g_nprocs * sizeof(int));
-    }
-    MPI_Gather(&n_out_cells, 1, MPI_INT, cell_counts, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Gather(&n_out_ele, 1, MPI_INT, ele_counts, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    int * meta_counts = NULL, * meta_displs = NULL;
-    int * coord_counts = NULL, * coord_displs = NULL;
-    int * etype_counts = NULL, * etype_displs = NULL;
-    int * all_meta = NULL, * all_etype = NULL;
-    float * all_coord = NULL;
-    int total_cells = 0, total_ele = 0;
-
-    if (g_rank == 0)
-    {
-        meta_counts = (int *)malloc(g_nprocs * sizeof(int));
-        meta_displs = (int *)malloc(g_nprocs * sizeof(int));
-        coord_counts = (int *)malloc(g_nprocs * sizeof(int));
-        coord_displs = (int *)malloc(g_nprocs * sizeof(int));
-        etype_counts = (int *)malloc(g_nprocs * sizeof(int));
-        etype_displs = (int *)malloc(g_nprocs * sizeof(int));
-
-        for (int r = 0; r < g_nprocs; r++)
-        {
-            meta_counts[r] = 2 * cell_counts[r];
-            coord_counts[r] = 3 * ele_counts[r];
-            etype_counts[r] = ele_counts[r];
-            meta_displs[r] = (r == 0) ? 0 : meta_displs[r - 1] + meta_counts[r - 1];
-            coord_displs[r] = (r == 0) ? 0 : coord_displs[r - 1] + coord_counts[r - 1];
-            etype_displs[r] = (r == 0) ? 0 : etype_displs[r - 1] + etype_counts[r - 1];
-            total_cells += cell_counts[r];
-            total_ele += ele_counts[r];
-        }
-        all_meta = (int *)malloc((total_cells > 0 ? 2 * total_cells : 1) * sizeof(int));
-        all_coord = (float *)malloc((total_ele > 0 ? 3 * total_ele : 1) * sizeof(float));
-        all_etype = (int *)malloc((total_ele > 0 ? total_ele : 1) * sizeof(int));
-    }
-
-    MPI_Gatherv(send_meta, 2 * n_out_cells, MPI_INT, all_meta, meta_counts, meta_displs, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Gatherv(send_coord, 3 * n_out_ele, MPI_FLOAT, all_coord, coord_counts, coord_displs, MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Gatherv(send_etype, n_out_ele, MPI_INT, all_etype, etype_counts, etype_displs, MPI_INT, 0, MPI_COMM_WORLD);
-
-    free(send_meta);
-    free(send_coord);
-    free(send_etype);
-
-    if (g_rank == 0)
-    {
-        char filename[50], outdir[50];
-        struct stat st;
-
-        sprintf(outdir, "%s", "PQR");
-        if (stat(outdir, &st) == -1 && errno == ENOENT)
-        {
-            if (MKDIR(outdir) != 0)
-                printf("WARNING in output_mpi(), directory %s doesn't exist and can't be created\n", outdir);
-        }
-
-        sprintf(filename, "%s/data.%d.pqr", outdir, step);
-        FILE * fp = fopen(filename, "w");
-        if (fp == NULL)
-        {
-            printf("Failed to open file for writing\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-
-        // cells arrive in rank order, so renumber atoms and cells globally
-        int global_atom = 0, global_cell = 0, coord_rd = 0, etype_rd = 0;
-        for (int c = 0; c < total_cells; c++)
-        {
-            int n = all_meta[2 * c + 0];
-            int ctype = all_meta[2 * c + 1];
-            for (int j = 0; j < n; j++)
+            if (n + 256 > cap)
             {
-                // written in the input frame, not the shifted one
-                fprintf(fp, "ATOM %6d C  THR   %5d      % .3f % .3f % .3f % .4f % .4f\n",
-                        global_atom + 1, (global_cell + 1) + ctype * 1000,
-                        all_coord[coord_rd + 0] - g_shift_x,
-                        all_coord[coord_rd + 1] - g_shift_y,
-                        all_coord[coord_rd + 2] - g_shift_z,
-                        0.1 * all_etype[etype_rd], 1.5);
-                coord_rd += 3;
-                etype_rd++;
-                global_atom++;
+                cap *= 2;
+                buf = (char *)realloc(buf, cap);
+                assert(buf);
             }
-            global_cell++;
+            // written in the input frame, not the shifted one
+            n += (size_t)snprintf(buf + n, cap - n,
+                    "ATOM %6d C  THR   %5d      % .3f % .3f % .3f % .4f % .4f\n",
+                    gatom + 1, (gcell + 1) + cell_type[i] * 1000,
+                    x[k] - g_shift_x, y[k] - g_shift_y, z[k] - g_shift_z,
+                    0.1 * ele_type[k], 1.5);
+            gatom++;
         }
-        fclose(fp);
-
-        free(cell_counts);
-        free(ele_counts);
-        free(meta_counts);
-        free(meta_displs);
-        free(coord_counts);
-        free(coord_displs);
-        free(etype_counts);
-        free(etype_displs);
-        free(all_meta);
-        free(all_coord);
-        free(all_etype);
+        gcell++;
     }
+    free(out);
+    g_output_io += MPI_Wtime() - t0;
+
+    // byte offset of this rank's slice, and the exact size of the finished file
+    t0 = MPI_Wtime();
+    MPI_Offset local = (MPI_Offset)n;
+    MPI_Offset offset = 0;
+    MPI_Offset total = 0;
+    MPI_Exscan(&local, &offset, 1, MPI_OFFSET, MPI_SUM, MPI_COMM_WORLD);
+    if (g_rank == 0) offset = 0;
+    MPI_Allreduce(&local, &total, 1, MPI_OFFSET, MPI_SUM, MPI_COMM_WORLD);
+
+    // the directory has to exist before the collective open
+    if (g_rank == 0)
+    {
+        struct stat st;
+        if (stat("PQR", &st) == -1 && errno == ENOENT)
+            MKDIR("PQR");
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    char filename[64];
+    sprintf(filename, "PQR/data.%d.pqr", step);
+
+    MPI_File fh;
+    if (MPI_File_open(MPI_COMM_WORLD, filename, MPI_MODE_CREATE | MPI_MODE_WRONLY,
+                      MPI_INFO_NULL, &fh) != MPI_SUCCESS)
+    {
+        fprintf(stderr, "[rank %d] MPI_File_open(%s) failed\n", g_rank, filename);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    MPI_File_set_size(fh, total); // trim a stale longer file to this run's size
+    g_output_comm += MPI_Wtime() - t0;
+
+    t0 = MPI_Wtime();
+    MPI_File_write_at_all(fh, offset, buf, (int)n, MPI_CHAR, MPI_STATUS_IGNORE);
+    g_output_io += MPI_Wtime() - t0;
+
+    t0 = MPI_Wtime();
+    MPI_File_close(&fh);
+    g_output_comm += MPI_Wtime() - t0;
+
+    free(buf);
 }
 
 #pragma mark -
@@ -676,11 +558,19 @@ char * load_program_source(const char *filename)
 
 #pragma mark -
 #pragma mark Main OpenCL Routine
-int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_type, float dt, 
-          int max_ele_no, 
+int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_type, float dt,
+          int max_ele_no,
           int ele_no, int cell_no, int * ele_per_cell,
-          int * cclock, int * cycle)
+          int * cclock, int * cycle,
+          double *out_setup, double *out_loop, double *out_comm,
+          double *out_io)
 {
+    double t_func_start = MPI_Wtime();
+
+    // t_comm accumulates the wall time spent inside MPI calls in the loop
+    double t_comm = 0.0;
+    double t_comm0 = 0.0;
+
     int flag_print = 0;
     cl_program program[10], program1;
     cl_kernel kernel[12], kernel1;
@@ -783,7 +673,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     cl_uint nplat = 0;
     err = clGetPlatformIDs(0, NULL, &nplat);
     assert(err == CL_SUCCESS);
-    printf("# of Platforms = %u\n", nplat);
+    if (g_rank == 0) printf("# of Platforms = %u\n", nplat);
 
     cl_platform_id *plats = malloc(sizeof(cl_platform_id) * nplat);
     clGetPlatformIDs(nplat, plats, NULL);
@@ -815,14 +705,14 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             device_id = devs[local_rank % ndev];
             cpPlatform = plats[i];
             found = 1;
-            printf("[rank %d] using device %d of %u\n", g_rank, local_rank % ndev, ndev);
+            if (g_rank == 0) printf("[rank %d] using device %d of %u\n", g_rank, local_rank % ndev, ndev);
         }
         free(devs);
     }
     free(plats);
     assert(found);
 
-    printf("err = %d\n", err);
+    if (g_rank == 0) printf("err = %d\n", err);
     assert(err == CL_SUCCESS);
 
 #pragma mark Device Information
@@ -837,8 +727,10 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         err |= clGetDeviceInfo(device_id, CL_DEVICE_VERSION, sizeof(buf), 
 							  buf, &returned_size);
     	assert(err == CL_SUCCESS);
-        printf("Connecting to %s %s supporting ", vendor_name, device_name);
-        printf("%s...\n", buf);
+        if (g_rank == 0) {
+            printf("Connecting to %s %s supporting ", vendor_name, device_name);
+            printf("%s...\n", buf);
+        }
     }
 	
 #pragma mark Context and Command Queue
@@ -1381,6 +1273,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
     // start of time iterations
     int iterations = MAX_ITERATIONS;
+    double t_loop0 = MPI_Wtime();
     for(int iter = 0; iter < iterations; iter++)
     {
 #if 0
@@ -1493,12 +1386,14 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
             // counts first. what I send left lands in my left neighbour's right halo,
             // so the matching receive comes from the right
+            t_comm0 = MPI_Wtime();
             MPI_Sendrecv(&n_send_left, 1, MPI_INT, g_x_neighbour_left, 0,
                          &n_recv_right, 1, MPI_INT, g_x_neighbour_right, 0,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(&n_send_right, 1, MPI_INT, g_x_neighbour_right, 1,
                          &n_recv_left, 1, MPI_INT, g_x_neighbour_left, 1,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            t_comm += MPI_Wtime() - t_comm0;
 
             for (int s = 0; s < n_send_left; s++)
                 halo_pack(&halo_left, s, halo_left.send_idx[s], x, y, z, xc, yc, zc,
@@ -1507,6 +1402,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                 halo_pack(&halo_right, s, halo_right.send_idx[s], x, y, z, xc, yc, zc,
                           ele_per_cell, cell_type);
 
+            t_comm0 = MPI_Wtime();
             MPI_Sendrecv(halo_left.send_f, n_send_left * GHOST_FLOATS_PER_CELL, MPI_FLOAT, g_x_neighbour_left, 2,
                          halo_right.recv_f, n_recv_right * GHOST_FLOATS_PER_CELL, MPI_FLOAT, g_x_neighbour_right, 2,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -1519,6 +1415,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             MPI_Sendrecv(halo_right.send_i, n_send_right * GHOST_INTS_PER_CELL, MPI_INT, g_x_neighbour_right, 5,
                          halo_left.recv_i, n_recv_left * GHOST_INTS_PER_CELL, MPI_INT, g_x_neighbour_left, 5,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            t_comm += MPI_Wtime() - t_comm0;
 
             int n_recv_total = n_recv_left + n_recv_right;
             assert(local_cell_no + n_recv_total <= g_max_cell);
@@ -2110,6 +2007,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                 mig_pack(&mig_right, s, mig_right.send_idx[s], &arrays);
 
             int n_arr_left = 0, n_arr_right = 0;
+            t_comm0 = MPI_Wtime();
             MPI_Sendrecv(&n_mig_left, 1, MPI_INT, g_x_neighbour_left, 6,
                          &n_arr_right, 1, MPI_INT, g_x_neighbour_right, 6,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -2129,6 +2027,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             MPI_Sendrecv(mig_right.send_i, n_mig_right * MIG_INTS_PER_CELL, MPI_INT, g_x_neighbour_right, 11,
                          mig_left.recv_i, n_arr_left * MIG_INTS_PER_CELL, MPI_INT, g_x_neighbour_left, 11,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            t_comm += MPI_Wtime() - t_comm0;
 
             // free the departed slots before placing arrivals, so a slot vacated this
             // step can be refilled this step
@@ -2229,12 +2128,14 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                     send_hi[jy * g_nz + kz] = chem1_gpu[(i_hi * g_ny + jy) * g_nz + kz];
                 }
 
+            t_comm0 = MPI_Wtime();
             MPI_Sendrecv(send_lo, nyz, MPI_FLOAT, g_x_neighbour_left, 12,
                          recv_hi, nyz, MPI_FLOAT, g_x_neighbour_right, 12,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(send_hi, nyz, MPI_FLOAT, g_x_neighbour_right, 13,
                          recv_lo, nyz, MPI_FLOAT, g_x_neighbour_left, 13,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            t_comm += MPI_Wtime() - t_comm0;
 
             free(send_lo);
             free(send_hi);
@@ -2284,7 +2185,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         } // end of output
 
         // count the number of each cell type
-        if(iter%1000 == 0)
+        if(iter%OUTPUT_FR == 0)
         {
             count0 = 0, count1 = 0, count2 = 0, count3 = 0, count4 = 0;
             for(int i = 0; i < local_cell_no; i++)
@@ -2301,7 +2202,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             // reached by every rank or the rest deadlock in the next collective
             int local_counts[4] = {count1, count2, count3, count4};
             int total_counts[4];
+            t_comm0 = MPI_Wtime();
             MPI_Allreduce(local_counts, total_counts, 4, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            t_comm += MPI_Wtime() - t_comm0;
             count1 = total_counts[0];
             count2 = total_counts[1];
             count3 = total_counts[2];
@@ -2321,6 +2224,13 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             }
         }
     }
+
+    double t_loop_end = MPI_Wtime();
+
+    *out_setup      = t_loop0 - t_func_start;
+    *out_loop       = t_loop_end - t_loop0;
+    *out_comm       = t_comm + g_output_comm;
+    *out_io         = g_output_io;
 
     xfer_free(&halo_left);
     xfer_free(&halo_right);
@@ -2788,11 +2698,21 @@ int main (int argc, char * argv[]) {
     initial_chem_paras(x, y, z, id, cell_type, ele_type, cell_no, ele_per_cell);
 
     // Do the OpenCL calculation
-    runCL(x, y, z, id, cell_type, ele_type, dt, 
-          max_ele_no, 
+    double t_setup = 0.0, t_loop = 0.0, t_comm = 0.0, t_io = 0.0;
+    runCL(x, y, z, id, cell_type, ele_type, dt,
+          max_ele_no,
           ele_no, cell_no, ele_per_cell,
-          cclock, cycle);
-    
+          cclock, cycle,
+          &t_setup, &t_loop, &t_comm, &t_io);
+
+    // compute is the loop with the measured comm and io taken out
+    printf("[TIMING] IC=%s rank=%d cells=%d setup=%.2f loop=%.2f comm=%.2f io=%.2f "
+           "compute=%.2f wall=%.2f s\n",
+           InName, g_rank, cell_no, t_setup, t_loop, t_comm, t_io,
+           t_loop - t_comm - t_io, t_setup + t_loop);
+    fflush(stdout);
+
+
     // Verify if the cells remained within the domain
     verifyDomain(x, y, z, max_ele_no);
 

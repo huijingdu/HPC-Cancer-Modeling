@@ -11,7 +11,7 @@ LDFLAGS =       -lm -std=c99
 default: aa
 
 clean:
-	rm -f *.o
+	rm -f *.o aa
 
 tagsfile:
 	ctags *.c
