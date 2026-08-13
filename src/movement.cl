@@ -137,7 +137,10 @@ __global const int * bin_offset,
 __const float inter_dist,
 __const int bins_x,
 __const int bins_y,
-__const int bins_z)
+__const int bins_z,
+__const float bin_ox,
+__const float bin_oy,
+__const float bin_oz)
 {
     int gId = get_global_id(0); //get the global ID of this work unit.
     int cellId = gId/max_ele;
@@ -165,9 +168,10 @@ __const int bins_z)
     }
 
     // inter-cell interactions, sweeping the 27-bin neighborhood of cell centers
-    int my_bx = (int)floor(xc[cellId] / inter_dist);
-    int my_by = (int)floor(yc[cellId] / inter_dist);
-    int my_bz = (int)floor(zc[cellId] / inter_dist);
+    int my_bx = (int)floor((xc[cellId] - bin_ox) / inter_dist);
+    int my_by = (int)floor((yc[cellId] - bin_oy) / inter_dist);
+    int my_bz = (int)floor((zc[cellId] - bin_oz) / inter_dist);
+    // the host regrows the grid to fit every center, so these only guard indexing
     if (my_bx < 0) my_bx = 0;
     if (my_by < 0) my_by = 0;
     if (my_bz < 0) my_bz = 0;
@@ -180,10 +184,12 @@ __const int bins_z)
         if (nz < 0 || nz >= bins_z) continue;
 
         for (int dy = -1; dy <= 1; ++dy) {
-            int ny = (my_by + dy + bins_y) % bins_y;
+            int ny = my_by + dy;
+            if (ny < 0 || ny >= bins_y) continue;
 
             for (int dx = -1; dx <= 1; ++dx) {
-                int nx = (my_bx + dx + bins_x) % bins_x;
+                int nx = my_bx + dx;
+                if (nx < 0 || nx >= bins_x) continue;
 
                 int nbin = nx + ny * bins_x + nz * bins_x * bins_y;
                 int start = bin_offset[nbin];
@@ -196,27 +202,16 @@ __const int bins_z)
                     // cell-cell cull: reject the whole 20x20 element block cheaply
                     float dist = 20.0f;
                     x_dist = fabs(xc[cellId] - xc[k]);
-                    if (x_dist > dist && lx - x_dist > dist) continue;
+                    if (x_dist > dist) continue;
                     y_dist = fabs(yc[cellId] - yc[k]);
-                    if (y_dist > dist && ly - y_dist > dist) continue;
-
-                    float x_shift = 0.0f;
-                    if (x_dist > (lx - x_dist)) {
-                        x_dist = lx - x_dist;
-                        x_shift = (xc[k] > xc[cellId]) ? -lx : lx;
-                    }
-                    float y_shift = 0.0f;
-                    if (y_dist > (ly - y_dist)) {
-                        y_dist = ly - y_dist;
-                        y_shift = (yc[k] > yc[cellId]) ? -ly : ly;
-                    }
+                    if (y_dist > dist) continue;
                     z_dist = fabs(zc[cellId] - zc[k]);
                     if (distance3_new(x_dist, y_dist, z_dist) > dist) continue;
 
                     for (j = 0; j < ele_per_cell[k]; ++j) {
                         i = k * max_ele + j;
-                        x_dist = x[gId] - (x[i] + x_shift);
-                        y_dist = y[gId] - (y[i] + y_shift);
+                        x_dist = x[gId] - x[i];
+                        y_dist = y[gId] - y[i];
                         z_dist = z[gId] - z[i];
                         r = distance3_new(x_dist, y_dist, z_dist);
                         if (r >= 12.0f) continue; // inter potentials are 0 past 12

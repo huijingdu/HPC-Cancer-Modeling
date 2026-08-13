@@ -1,13 +1,21 @@
 #!/bin/bash
 #SBATCH --time=24:00:00
-#SBATCH --mem-per-cpu=1024
-#SBATCH --job-name=cancer_code
+#SBATCH --mem-per-cpu=6144
+#SBATCH --job-name=test_cancer_code
 #SBATCH --error=job.%J.err
 #SBATCH --output=job.%J.out
-#SBATCH --partition=gpu --gres=gpu
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=2
+#SBATCH --partition=gpu --gres=gpu:2
 
-module load compiler/gcc/9 cuda/12.2
+module load compiler/gcc/9 cuda/12.2 openmpi
+export PSM2_CUDA=0 # Omni-Path: keep CUDA buffers out of MPI
+
 make
-for ic in Input/*; do
-    (time ./aa "$ic")
+
+mkdir -p PQR
+command -v lfs > /dev/null && lfs setstripe -c 8 -S 4m PQR 2> /dev/null
+
+for ic in Input/IC_60K; do
+    mpirun -np "$SLURM_NTASKS" ./aa "$ic"
 done
