@@ -333,7 +333,6 @@ void sniff_ic(const char InName[], int *cell_no_out, float *mx_out, float *my_ou
     float nx = 0.0f, ny = 0.0f, nz = 0.0f;
     float px, py, pz, pxc, pyc, pzc;
     int pid, ptype, pele, ptime, pcyc;
-        
 
     for (int i = 0; i < temp_cell_no; i++) {
         fscanf(fp, "%d %d %d %f %f %f %d %d\n",
