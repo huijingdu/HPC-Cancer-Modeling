@@ -1593,36 +1593,44 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         clFinish(cmd_queue);
 
 
-#if 0
         // start of cell growth
-        if((iter-1)%GROWTH_FR == 0)
+        if((iter-1)%GROWTH_FR == 0 && local_cell_no > 0)
         {
-            for(int i = 0; i < cell_no; i++)
+            // owned cells only. the slots above hold this step's ghosts, which are
+            // read-only copies: growing one would diverge from its owner and then be
+            // overwritten by the next halo exchange
+            for(int i = 0; i < local_cell_no; i++)
             {
                 flag[i] = 0;
             }
-	        buffer_size = sizeof(int) * g_max_cell;
-  	        err = clEnqueueWriteBuffer(cmd_queue, flag_mem, CL_TRUE, 0, buffer_size,
-	    						(void*)flag, 0, NULL, NULL);
-	    	err |= clEnqueueWriteBuffer(cmd_queue, flag_death_mem, CL_TRUE, 0, buffer_size,
-	    						(void*)flag_death, 0, NULL, NULL);
-    		err |= clSetKernelArg(kernel[1],  5, sizeof(int), &ele_no);
-    		assert(err == CL_SUCCESS);
-            global_work_size = cell_no;
-	    	err = clEnqueueNDRangeKernel(cmd_queue, kernel[1], 1, NULL, 
-	    								 &global_work_size, NULL, 0, NULL, NULL);
-	    	assert(err == CL_SUCCESS);
-    		clFinish(cmd_queue);
-            
-    		err = clEnqueueReadBuffer(cmd_queue, flag_mem, CL_TRUE, 0, cell_no*sizeof(int), 
-    				          flag, 0, NULL, NULL);
-    		assert(err == CL_SUCCESS);
-            for(int i = 0; i < cell_no; i++)
+
+            buffer_size = sizeof(int) * g_max_cell;
+            err = clEnqueueWriteBuffer(cmd_queue, flag_mem, CL_TRUE, 0, buffer_size,
+                                       (void*)flag, 0, NULL, NULL);
+            err |= clEnqueueWriteBuffer(cmd_queue, flag_death_mem, CL_TRUE, 0, buffer_size,
+                                       (void*)flag_death, 0, NULL, NULL);
+            err |= clSetKernelArg(kernel[1], 5, sizeof(int), &ele_no);
+            assert(err == CL_SUCCESS);
+
+            global_work_size = local_cell_no;
+            err = clEnqueueNDRangeKernel(cmd_queue, kernel[1], 1, NULL,
+                                         &global_work_size, NULL, 0, NULL, NULL);
+            assert(err == CL_SUCCESS);
+            clFinish(cmd_queue);
+
+            err = clEnqueueReadBuffer(cmd_queue, flag_mem, CL_TRUE, 0, local_cell_no*sizeof(int),
+                                      flag, 0, NULL, NULL);
+            // the kernel appended an element, so the host mirror of ele_per_cell is
+            // stale. the halo pack, the division gate and the type tally all read it
+            err |= clEnqueueReadBuffer(cmd_queue, ele_per_cell_mem, CL_TRUE, 0,
+                                       local_cell_no*sizeof(int), ele_per_cell, 0, NULL, NULL);
+            assert(err == CL_SUCCESS);
+
+            for(int i = 0; i < local_cell_no; i++)
             {
                 if(flag[i] == 1) ele_no++;
             }
         } // end of cell growth
-#endif
 
         // start of cell division
         if((iter-1)%DIVISION_FR == 0 && local_cell_no > 0 && local_cell_no < g_max_cell)
@@ -2123,8 +2131,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         }
 
 #if 0
-        // chem field halo. off while chem_rk_gpu, growth, division and death are all
-        // #if 0, so chem1/chem2 stay zero and this would only shuffle zeros. turning
+        // chem field halo. off because nothing writes chem1/chem2: chem_rk_gpu and the
+        // initial-field fill are both still #if 0, so this would only shuffle zeros.
+        // growth and division are now live but neither touches the chem field. turning
         // it on first needs the 3D chem field partitioned in X, one slab per rank;
         // right now every rank holds the whole field.
         {
