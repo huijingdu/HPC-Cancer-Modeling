@@ -1624,9 +1624,8 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         } // end of cell growth
 #endif
 
-#if 0
         // start of cell division
-        if((iter-1)%DIVISION_FR == 0 && cell_no < g_max_cell)
+        if((iter-1)%DIVISION_FR == 0 && local_cell_no > 0 && local_cell_no < g_max_cell)
         {
             err = clEnqueueReadBuffer(cmd_queue, id_mem, CL_TRUE, 0, max_ele_no*sizeof(int),
                               id, 0, NULL, NULL);
@@ -1638,52 +1637,44 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                               z, 0, NULL, NULL);
             err |= clEnqueueReadBuffer(cmd_queue, ele_type_mem, CL_TRUE, 0, max_ele_no*sizeof(int),
                               ele_type, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, ele_per_cell_mem, CL_TRUE, 0, cell_no*sizeof(int),
+            // owned range only: the slots above hold this step's ghosts
+            err |= clEnqueueReadBuffer(cmd_queue, ele_per_cell_mem, CL_TRUE, 0, local_cell_no*sizeof(int),
                               ele_per_cell, 0, NULL, NULL);
             err |= clEnqueueReadBuffer(cmd_queue, chem1_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(float),
                               chem1_gpu, 0, NULL, NULL);
             err |= clEnqueueReadBuffer(cmd_queue, chem2_gpu_mem, CL_TRUE, 0, g_nx*g_ny*g_nz*sizeof(float),
                               chem2_gpu, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, xc_mem, CL_TRUE, 0, g_max_cell*sizeof(float),
+            err |= clEnqueueReadBuffer(cmd_queue, xc_mem, CL_TRUE, 0, local_cell_no*sizeof(float),
                               xc, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, yc_mem, CL_TRUE, 0, g_max_cell*sizeof(float),
+            err |= clEnqueueReadBuffer(cmd_queue, yc_mem, CL_TRUE, 0, local_cell_no*sizeof(float),
                               yc, 0, NULL, NULL);
-            err |= clEnqueueReadBuffer(cmd_queue, zc_mem, CL_TRUE, 0, g_max_cell*sizeof(float),
+            err |= clEnqueueReadBuffer(cmd_queue, zc_mem, CL_TRUE, 0, local_cell_no*sizeof(float),
                               zc, 0, NULL, NULL);
             assert(err == CL_SUCCESS);
 
-            int tmp_cell_no = cell_no;
+            // age once up front
+            for(int i = 0; i < local_cell_no; i++)
+            {
+                if(ele_per_cell[i] <= 0) continue;
+                cclock[i] += DIVISION_FR;
+            }
+
+            int tmp_cell_no = local_cell_no;
             float tmpx0, tmpy0, tmpz0;
             int tmpn0, tmptype0;
             float tmpx[MAX_ELE], tmpy[MAX_ELE], tmpz[MAX_ELE];
             int tmptype[MAX_ELE];
             int id_for_new_cell;
-            for(int i = 0; i < cell_no; i++)
+            int search_from = 0;
+            for(int i = 0; i < local_cell_no; i++)
             {
-                cclock[i] += DIVISION_FR;
-                if(cell_type[i]==2)
+                if(ele_per_cell[i] <= 0) continue; // dead, or migrated away
+                if(flag_print && cell_type[i]==2)
                     printf("cell[%d]  cell_type %d  element_per_cell %d  cclock %d  cycle %d\n",
                             i, cell_type[i], ele_per_cell[i], cclock[i], cycle[i]);
                 if(cell_type[i] >= 3) continue; // cell no division
                 if(ele_per_cell[i] < 16) continue;
                 if(cclock[i] < cycle[i]) continue; // cell not mature
-
-                printf("read to divide\n");
-
-                if(no_empty > 0)
-                {
-                    for(int j = 0; j < cell_no; j++)
-                    {
-                        if(ele_per_cell[j] == 0)
-                        {
-                            id_for_new_cell = j;
-                        }
-                    }
-                }
-                else
-                {
-                    id_for_new_cell = tmp_cell_no;
-                }
 
                 tmpx0 = tmpy0 = tmpz0 = 0.0;
                 tmpn0 = tmptype0 = 0;
@@ -1705,10 +1696,12 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
                 if(tmpn0 <= 0 || tmpn0 != ele_per_cell[i] || ele_per_cell[i] < 0)
                 {
-                    exit(-1);
+                    fprintf(stderr, "[rank %d] cell %d owns %d of its %d elements\n",
+                            g_rank, i, tmpn0, ele_per_cell[i]);
+                    MPI_Abort(MPI_COMM_WORLD, 1);
                 }
 
-                tmpx0 = tmpx0/tmpn0; 
+                tmpx0 = tmpx0/tmpn0;
                 tmpy0 = tmpy0/tmpn0;
                 tmpz0 = tmpz0/tmpn0;
 
@@ -1719,19 +1712,51 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                 // cell_type[id_for_new_cell] = (ctype1 >= ctype2)? ctype1 : ctype2; // the big type goes up
                 if(cell_type[i] == 1) // mother is slow-dividing cell
                 {
-                    cell_type[i] = 1;
-                    cell_type[id_for_new_cell] = 1;
-                    if(RNG() < R_Diff) cell_type[id_for_new_cell] = 2;
-                    ctype1 = cell_type[i];
-                    ctype2 = cell_type[id_for_new_cell];
+                    ctype1 = 1;
+                    ctype2 = (RNG() < R_Diff)? 2 : 1;
                 }
                 else // mother is fast-dividing cell
                 {
-                    cell_type[i] = 2;
-                    cell_type[id_for_new_cell] = 2;
-                    ctype1 = cell_type[i];
-                    ctype2 = cell_type[id_for_new_cell];
+                    ctype1 = 2;
+                    ctype2 = 2;
                 }
+
+                // the daughter types pick the split axis. a one-sided split would
+                // give the daughter a slot and no elements, so skip it instead
+                int n_mother = 0;
+                for(int j = 0; j < ele_per_cell[i]; j++)
+                {
+                    if(ctype1 == ctype2) { if(tmpx[j] > tmpx0) n_mother++; }
+                    else                 { if(tmpz[j] <= tmpz0) n_mother++; }
+                }
+                if(n_mother == 0 || n_mother == ele_per_cell[i]) continue;
+
+                // reuse a slot freed by death or migration, else extend the range
+                id_for_new_cell = -1;
+                for(int j = search_from; j < tmp_cell_no; j++)
+                {
+                    if(ele_per_cell[j] == 0) { id_for_new_cell = j; break; }
+                }
+                if(id_for_new_cell == -1)
+                {
+                    if(tmp_cell_no >= g_max_cell)
+                    {
+                        fprintf(stderr, "[rank %d] division needs slot %d, past g_max_cell %d\n",
+                                g_rank, tmp_cell_no, g_max_cell);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                    }
+                    id_for_new_cell = tmp_cell_no;
+                    tmp_cell_no++;
+                }
+                search_from = id_for_new_cell + 1;
+
+                cell_type[i] = ctype1;
+                cell_type[id_for_new_cell] = ctype2;
+
+                // a reused slot still carries the previous occupant's state
+                flag_gener[id_for_new_cell] = flag_gener[i];
+                OVOL1[id_for_new_cell] = OVOL1[i];
+                OVOL2[id_for_new_cell] = OVOL2[i];
 
                 flag_death[i] = flag_death[id_for_new_cell] = 0;
 
@@ -1742,8 +1767,8 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                     cycle[i] = (int)(1000.0f*(C2_MEAN + RNG()*C2_STD));
                 else
                 {
-                    printf("ERROR::cell division, wrong cell type = %d\n", cell_type[i]);
-                    exit(0);
+                    fprintf(stderr, "ERROR::cell division, wrong cell type = %d\n", cell_type[i]);
+                    MPI_Abort(MPI_COMM_WORLD, 1);
                 }
                 if(cell_type[id_for_new_cell] == 1)
                     cycle[id_for_new_cell] = (int)(1000.0f*(C1_MEAN + RNG()*C1_STD));
@@ -1751,8 +1776,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                     cycle[id_for_new_cell] = (int)(1000.0f*(C2_MEAN + RNG()*C2_STD));
                 else
                 {
-                    printf("ERROR::cell division, wrong cell type = %d\n", cell_type[i]);
-                    exit(0);
+                    fprintf(stderr, "ERROR::cell division, wrong cell type = %d\n",
+                            cell_type[id_for_new_cell]);
+                    MPI_Abort(MPI_COMM_WORLD, 1);
                 }
 
                 // copy data in tmp to two daughter cells
@@ -1820,8 +1846,8 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                 {
                     for(int j = 0; j < ele_per_cell[i]; j++)
                     {
-                        int k = i*MAX_ELE + ele_per_cell[i];
-                        if(ele_type[k] != 2) 
+                        int k = i*MAX_ELE + j;
+                        if(ele_type[k] != 2)
                         {
                             ele_type[k] = 2;
                             count_ele_type2_1++;
@@ -1841,8 +1867,8 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                 {
                     for(int j = 0; j < ele_per_cell[id_for_new_cell]; j++)
                     {
-                        int k = id_for_new_cell*MAX_ELE + ele_per_cell[id_for_new_cell];
-                        if(ele_type[k] != 2) 
+                        int k = id_for_new_cell*MAX_ELE + j;
+                        if(ele_type[k] != 2)
                         {
                             ele_type[k] = 2;
                             count_ele_type2_2++;
@@ -1859,20 +1885,8 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                     }
                 }
 
-                if(no_empty > 0)
-                {
-                    no_empty--;
-                }
-                else
-                {
-                    tmp_cell_no++;
-                }
-                if(tmp_cell_no >= g_max_cell)
-                {
-                    exit(0);
-                } 
             }
-            cell_no = tmp_cell_no;
+            local_cell_no = tmp_cell_no;
 
             err = clEnqueueWriteBuffer(cmd_queue, id_mem, CL_TRUE, 0, max_ele_no*sizeof(int),
                             (void*)id, 0, NULL, NULL);
@@ -1882,17 +1896,20 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                             (void*)y, 0, NULL, NULL);
             err |= clEnqueueWriteBuffer(cmd_queue, z_mem, CL_TRUE, 0, max_ele_no*sizeof(float),
                             (void*)z, 0, NULL, NULL);
-            err |= clEnqueueWriteBuffer(cmd_queue, cell_type_mem, CL_TRUE, 0, cell_no*sizeof(int),
+            err |= clEnqueueWriteBuffer(cmd_queue, cell_type_mem, CL_TRUE, 0, local_cell_no*sizeof(int),
                             (void*)cell_type, 0, NULL, NULL);
             err |= clEnqueueWriteBuffer(cmd_queue, ele_type_mem, CL_TRUE, 0, max_ele_no*sizeof(int),
                             (void*)ele_type, 0, NULL, NULL);
-            err |= clEnqueueWriteBuffer(cmd_queue, ele_per_cell_mem, CL_TRUE, 0, cell_no*sizeof(int),
+            err |= clEnqueueWriteBuffer(cmd_queue, ele_per_cell_mem, CL_TRUE, 0, local_cell_no*sizeof(int),
                             (void*)ele_per_cell, 0, NULL, NULL);
-            err |= clEnqueueWriteBuffer(cmd_queue, flag_gener_mem, CL_TRUE, 0, cell_no*sizeof(int),
+            err |= clEnqueueWriteBuffer(cmd_queue, flag_gener_mem, CL_TRUE, 0, local_cell_no*sizeof(int),
                             (void*)flag_gener, 0, NULL, NULL);
+            err |= clEnqueueWriteBuffer(cmd_queue, o1_mem, CL_TRUE, 0, local_cell_no*sizeof(float),
+                            (void*)OVOL1, 0, NULL, NULL);
+            err |= clEnqueueWriteBuffer(cmd_queue, o2_mem, CL_TRUE, 0, local_cell_no*sizeof(float),
+                            (void*)OVOL2, 0, NULL, NULL);
             assert(err == CL_SUCCESS);
         } // end of cell division
-#endif
 
 #if 0
         // start of cell death
@@ -2176,10 +2193,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             {
                 int k = i*MAX_ELE + j;
                 
-                if(isnan(x[k]) || isnan(y[k]) || isnan(z[k]))
-                {
-                    exit(-1);
-                }
+                assert(!isnan(x[k]) && !isnan(y[k]) && !isnan(z[k]));
             }
         } // end of output
 
