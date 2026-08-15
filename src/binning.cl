@@ -55,20 +55,102 @@ __kernel void cell_bounds(
         atomic_max(&bounds[5], (int)floor(zc[gId]));
 }
 
-// Kernel 2: constructs a prefix sum array from the bin_count array
-__kernel void bin_prefix_sum(
-    __global int * bin_count,
+// Exclusive scan across one work group. Returns this item's prefix and leaves
+// the inclusive scan in scratch[0..lsz-1], so the group total is scratch[lsz-1]
+int wg_exclusive_scan(int v, __local int * scratch, int lid, int lsz) {
+    __local int * cur = scratch;
+    __local int * nxt = scratch + lsz;
+
+    cur[lid] = v;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int off = 1; off < lsz; off <<= 1) {
+        int t = cur[lid];
+        if (lid >= off) t += cur[lid - off];
+        barrier(CLK_LOCAL_MEM_FENCE); // reads of cur have landed
+        nxt[lid] = t;
+        barrier(CLK_LOCAL_MEM_FENCE); // writes of nxt have landed
+        __local int * tmp = cur; cur = nxt; nxt = tmp;
+    }
+
+    // the sweep ends in either half, so settle it in the first one
+    int inclusive = cur[lid];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    scratch[lid] = inclusive;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    return inclusive - v;
+}
+
+// Kernel 2a: exclusive scan of bin_count within each work group
+// reads bin_count but never writes it
+__kernel void bin_block_scan(
+    __global const int * bin_count,
     __const int nbins,
-    __global int * bin_offset) {
-        if (get_global_id(0) != 0) return;
-        int acc = 0;
-        for (int i = 0; i < nbins; ++i) {
-            int cnt = bin_count[i];
-            bin_offset[i] = acc;
-            bin_count[i] = acc; // reset to bin start so scatter can use it as a cursor
+    __global int * bin_offset,
+    __global int * block_sums,
+    __local int * scratch) {
+        int i = get_global_id(0);
+        int lid = get_local_id(0);
+        int lsz = get_local_size(0);
+
+        // the last group runs past nbins, and only [0, nbins) is zeroed, so the
+        // tail contributes zero rather than reading stale counts
+        int v = (i < nbins) ? bin_count[i] : 0;
+
+        int excl = wg_exclusive_scan(v, scratch, lid, lsz);
+
+        if (i < nbins) bin_offset[i] = excl;
+        if (lid == lsz - 1) block_sums[get_group_id(0)] = scratch[lsz - 1];
+}
+
+// Kernel 2b: exclusive scan of the group totals by a single work group
+__kernel void bin_scan_block_sums(
+    __global int * block_sums,
+    __const int nblocks,
+    __local int * scratch) {
+        int lid = get_local_id(0);
+        int lsz = get_local_size(0);
+
+        int chunk = (nblocks + lsz - 1) / lsz;
+        int lo = lid * chunk;
+        int hi = lo + chunk;
+        if (hi > nblocks) hi = nblocks; // trailing items get an empty slice
+
+        int sum = 0;
+        for (int i = lo; i < hi; ++i) sum += block_sums[i];
+
+        int base = wg_exclusive_scan(sum, scratch, lid, lsz);
+        int total = scratch[lsz - 1];
+
+        // each item rewrites only the slice it read, so the passes never race
+        int acc = base;
+        for (int i = lo; i < hi; ++i) {
+            int cnt = block_sums[i];
+            block_sums[i] = acc;
             acc += cnt;
         }
-        bin_offset[nbins] = acc;
+
+        // the grand total rides in the spare slot for 2c to publish
+        if (lid == 0) block_sums[nblocks] = total;
+}
+
+// Kernel 2c: shifts each group's local scan by that group's offset, mirroring
+// the result into bin_count as bin_scatter's write cursor
+__kernel void bin_add_block_offsets(
+    __global int * bin_count,
+    __const int nbins,
+    __global int * bin_offset,
+    __global const int * block_sums,
+    __const int nblocks) {
+        int i = get_global_id(0);
+        // movement.cl reads bin_offset[nbin + 1], so the last bin needs this
+        if (i == 0) bin_offset[nbins] = block_sums[nblocks];
+        if (i >= nbins) return;
+
+        int start = bin_offset[i] + block_sums[get_group_id(0)];
+        bin_offset[i] = start;
+        bin_count[i] = start; // bin start, so scatter can use it as a cursor
 }
 
 // Kernel 3: distributes cell ids by batching them by bins

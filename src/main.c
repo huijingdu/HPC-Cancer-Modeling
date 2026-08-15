@@ -572,7 +572,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
     int flag_print = 0;
     cl_program program[10], program1;
-    cl_kernel kernel[12], kernel1;
+    cl_kernel kernel[14], kernel1;
 	
     cl_command_queue cmd_queue;
     cl_context   context;
@@ -658,6 +658,10 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     // Bin related declarations (buffers created below, after context exists)
     cl_mem bin_count_mem, bin_offset_mem, cell_list_mem;
     cl_mem bin_bounds_mem, bin_overflow_mem;
+    cl_mem block_sums_mem; // per-group totals for the scan, plus the grand total
+    // kernels 2a and 2c must share this local size for get_group_id to line up
+    size_t scan_wg = 0;
+    int scan_nblocks = 0;
 
     // Get platform and device information
     cl_platform_id *platform_id = NULL;
@@ -864,14 +868,53 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
         char build[2048] = {0};
         clGetProgramBuildInfo(program[8], device_id, CL_PROGRAM_BUILD_LOG, sizeof(build), build, NULL);
+        if (err != CL_SUCCESS)
+        {
+            fprintf(stderr, "[rank %d] binning.cl build failed (%d):\n%s\n", g_rank, err, build);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
 
         kernel[8] = clCreateKernel(program[8], "bin_count", &err);
         assert(err == CL_SUCCESS);
-        kernel[9] = clCreateKernel(program[8], "bin_prefix_sum", &err);
+        kernel[9] = clCreateKernel(program[8], "bin_block_scan", &err);
         assert(err == CL_SUCCESS);
         kernel[10] = clCreateKernel(program[8], "bin_scatter", &err);
         assert(err == CL_SUCCESS);
         kernel[11] = clCreateKernel(program[8], "cell_bounds", &err);
+        assert(err == CL_SUCCESS);
+        kernel[12] = clCreateKernel(program[8], "bin_scan_block_sums", &err);
+        assert(err == CL_SUCCESS);
+        kernel[13] = clCreateKernel(program[8], "bin_add_block_offsets", &err);
+        assert(err == CL_SUCCESS);
+
+        // largest power-of-two group the device and all three scan kernels allow
+        size_t dev_max = 0;
+        err = clGetDeviceInfo(device_id, CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                              sizeof(dev_max), &dev_max, NULL);
+        assert(err == CL_SUCCESS);
+
+        const int scan_kernels[3] = {9, 12, 13};
+        scan_wg = dev_max < 256 ? dev_max : 256;
+        for (int k = 0; k < 3; k++)
+        {
+            size_t kmax = 0;
+            err = clGetKernelWorkGroupInfo(kernel[scan_kernels[k]], device_id,
+                                           CL_KERNEL_WORK_GROUP_SIZE, sizeof(kmax), &kmax, NULL);
+            assert(err == CL_SUCCESS);
+            if (kmax < scan_wg) scan_wg = kmax;
+        }
+
+        size_t pow2 = 1;
+        while (pow2 * 2 <= scan_wg) pow2 *= 2;
+        scan_wg = pow2;
+        assert(scan_wg >= 1);
+
+        scan_nblocks = (g_nbins + (int)scan_wg - 1) / (int)scan_wg;
+        if (g_rank == 0) printf("[bin] scan work group %d, %d group(s) over %d bins\n",
+                                (int)scan_wg, scan_nblocks, g_nbins);
+
+        block_sums_mem = clCreateBuffer(context, CL_MEM_READ_WRITE,
+                                        (scan_nblocks + 1) * sizeof(int), NULL, &err);
         assert(err == CL_SUCCESS);
     }
 
@@ -1157,10 +1200,23 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         // arg 4 (cell_no) set per step
         err |= clSetKernelArg(kernel[11], 5, sizeof(cl_mem), &bin_bounds_mem);
 
-        // kernel[9] bin_prefix_sum
+        // kernels 9, 12, and 13; the three levels of the bin scan
+        const size_t scan_scratch = 2 * scan_wg * sizeof(int);
         err |= clSetKernelArg(kernel[9], 0, sizeof(cl_mem), &bin_count_mem);
         err |= clSetKernelArg(kernel[9], 1, sizeof(int), &nbins_i);
         err |= clSetKernelArg(kernel[9], 2, sizeof(cl_mem), &bin_offset_mem);
+        err |= clSetKernelArg(kernel[9], 3, sizeof(cl_mem), &block_sums_mem);
+        err |= clSetKernelArg(kernel[9], 4, scan_scratch, NULL);
+
+        err |= clSetKernelArg(kernel[12], 0, sizeof(cl_mem), &block_sums_mem);
+        err |= clSetKernelArg(kernel[12], 1, sizeof(int), &scan_nblocks);
+        err |= clSetKernelArg(kernel[12], 2, scan_scratch, NULL);
+
+        err |= clSetKernelArg(kernel[13], 0, sizeof(cl_mem), &bin_count_mem);
+        err |= clSetKernelArg(kernel[13], 1, sizeof(int), &nbins_i);
+        err |= clSetKernelArg(kernel[13], 2, sizeof(cl_mem), &bin_offset_mem);
+        err |= clSetKernelArg(kernel[13], 3, sizeof(cl_mem), &block_sums_mem);
+        err |= clSetKernelArg(kernel[13], 4, sizeof(int), &scan_nblocks);
 
         // kernel[10] bin_scatter
         err |= clSetKernelArg(kernel[10], 0, sizeof(cl_mem), &xc_mem);
@@ -1460,7 +1516,6 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         }
 
         size_t gws_cells = combined_cell_no;
-        size_t one = 1;
         int zero_int = 0;
 
         err = clSetKernelArg(kernel[8], 4, sizeof(int), &combined_cell_no); // bin_count cell_no
@@ -1511,15 +1566,19 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             int old_nbins = g_nbins;
             fit_bin_grid((float)b[0], (float)b[1] + 1.0f, (float)b[2], (float)b[3] + 1.0f,
                          (float)b[4], (float)b[5] + 1.0f);
+            scan_nblocks = (g_nbins + (int)scan_wg - 1) / (int)scan_wg;
 
             if (g_nbins > old_nbins)
             {
                 clReleaseMemObject(bin_count_mem);
                 clReleaseMemObject(bin_offset_mem);
+                clReleaseMemObject(block_sums_mem);
                 bin_count_mem = clCreateBuffer(context, CL_MEM_READ_WRITE,
                                                g_nbins * sizeof(int), NULL, &err);
                 bin_offset_mem = clCreateBuffer(context, CL_MEM_READ_WRITE,
                                                 (g_nbins + 1) * sizeof(int), NULL, &err);
+                block_sums_mem = clCreateBuffer(context, CL_MEM_READ_WRITE,
+                                                (scan_nblocks + 1) * sizeof(int), NULL, &err);
                 assert(err == CL_SUCCESS);
 
                 free(bin_count_host);
@@ -1531,12 +1590,21 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                 err = clSetKernelArg(kernel[8], 9, sizeof(cl_mem), &bin_count_mem);
                 err |= clSetKernelArg(kernel[9], 0, sizeof(cl_mem), &bin_count_mem);
                 err |= clSetKernelArg(kernel[9], 2, sizeof(cl_mem), &bin_offset_mem);
+                err |= clSetKernelArg(kernel[9], 3, sizeof(cl_mem), &block_sums_mem);
+                err |= clSetKernelArg(kernel[12], 0, sizeof(cl_mem), &block_sums_mem);
+                err |= clSetKernelArg(kernel[13], 0, sizeof(cl_mem), &bin_count_mem);
+                err |= clSetKernelArg(kernel[13], 2, sizeof(cl_mem), &bin_offset_mem);
+                err |= clSetKernelArg(kernel[13], 3, sizeof(cl_mem), &block_sums_mem);
                 err |= clSetKernelArg(kernel[10], 9, sizeof(cl_mem), &bin_count_mem);
                 err |= clSetKernelArg(kernel[0], 22, sizeof(cl_mem), &bin_offset_mem);
                 assert(err == CL_SUCCESS);
             }
 
+            // the grid can shrink too, so the counts refresh on every refit
             err = clSetKernelArg(kernel[9], 1, sizeof(int), &g_nbins);
+            err |= clSetKernelArg(kernel[12], 1, sizeof(int), &scan_nblocks);
+            err |= clSetKernelArg(kernel[13], 1, sizeof(int), &g_nbins);
+            err |= clSetKernelArg(kernel[13], 4, sizeof(int), &scan_nblocks);
             err |= clSetKernelArg(kernel[8], 6, sizeof(int), &g_nbx);
             err |= clSetKernelArg(kernel[8], 7, sizeof(int), &g_nby);
             err |= clSetKernelArg(kernel[8], 8, sizeof(int), &g_nbz);
@@ -1558,7 +1626,12 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             assert(err == CL_SUCCESS);
         }
 
-        err = clEnqueueNDRangeKernel(cmd_queue, kernel[9], 1, NULL, &one, NULL, 0, NULL, NULL);
+        // three-level scan: scan within each group, scan the group totals, then
+        // shift each group by its offset. the queue is in-order, so no events
+        size_t gws_scan = (size_t)scan_nblocks * scan_wg;
+        err = clEnqueueNDRangeKernel(cmd_queue, kernel[9], 1, NULL, &gws_scan, &scan_wg, 0, NULL, NULL);
+        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[12], 1, NULL, &scan_wg, &scan_wg, 0, NULL, NULL);
+        err |= clEnqueueNDRangeKernel(cmd_queue, kernel[13], 1, NULL, &gws_scan, &scan_wg, 0, NULL, NULL);
         err |= clEnqueueNDRangeKernel(cmd_queue, kernel[10], 1, NULL, &gws_cells, NULL, 0, NULL, NULL);
         assert(err == CL_SUCCESS);
 
