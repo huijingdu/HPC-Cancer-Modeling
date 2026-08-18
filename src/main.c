@@ -228,6 +228,8 @@ static float g_dx, g_dy, g_dz;
 
 // grids index from 0, so the cloud is shifted at load and shifted back on output
 static float g_shift_x, g_shift_y, g_shift_z;
+// IC's own floor, carried into the movement kernel
+static float g_sub_z;
 
 // occupied x range after the shift, excluding padding
 static float g_cell_lo_x, g_cell_hi_x;
@@ -1246,6 +1248,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         err |= clSetKernelArg(kernel[0], 27, sizeof(float), &g_bin_ox);
         err |= clSetKernelArg(kernel[0], 28, sizeof(float), &g_bin_oy);
         err |= clSetKernelArg(kernel[0], 29, sizeof(float), &g_bin_oz);
+        err |= clSetKernelArg(kernel[0], 30, sizeof(float), &g_sub_z);
         assert(err == CL_SUCCESS);
     }
 
@@ -1623,6 +1626,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             err |= clSetKernelArg(kernel[0], 27, sizeof(float), &g_bin_ox);
             err |= clSetKernelArg(kernel[0], 28, sizeof(float), &g_bin_oy);
             err |= clSetKernelArg(kernel[0], 29, sizeof(float), &g_bin_oz);
+            err |= clSetKernelArg(kernel[0], 30, sizeof(float), &g_sub_z);
             assert(err == CL_SUCCESS);
         }
 
@@ -2580,6 +2584,7 @@ int main (int argc, char * argv[]) {
     g_shift_x = pad_x - nx_min;
     g_shift_y = pad_y - ny_min;
     g_shift_z = pad_z - nz_min;
+    g_sub_z = nz_min + g_shift_z; // the IC floor
 
     g_lx = span_x + 2.0f * pad_x;
     g_ly = span_y + 2.0f * pad_y;
