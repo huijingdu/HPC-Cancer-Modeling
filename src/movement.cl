@@ -140,7 +140,8 @@ __const int bins_y,
 __const int bins_z,
 __const float bin_ox,
 __const float bin_oy,
-__const float bin_oz)
+__const float bin_oz,
+__const float sub_z)
 {
     int gId = get_global_id(0); //get the global ID of this work unit.
     int cellId = gId/max_ele;
@@ -232,12 +233,19 @@ __const float bin_oz)
         }
     }
 
+    // external force, applied once per element, to the
+    // substrate-anchored elements of slow-dividing cells
+    if (cell_type[cellId] == 1 && type[gId] == 2) {
+        external_potential(x[gId], y[gId], z[gId] - sub_z - 1.0f, &x_F1, &y_F1, &z_F1, lx, ly, lz);
+    }
+
     float ratio = 0.5f;
     x_F[gId] = ratio * dt * x_F1 + x[gId];
     y_F[gId] = ratio * dt * y_F1 + y[gId];
     z_F[gId] = ratio * dt * z_F1 + z[gId];
     
-    if (z_F[gId] < -1.0f) z_F[gId] = -1.0f + 0.05f * eleId;
+    // no element may fall through the same plane external_potential pulls toward
+    if (z_F[gId] < sub_z) z_F[gId] = sub_z + 0.05f * eleId;
     
     r = distance3(x[gId], y[gId], z[gId], x_F[gId], y_F[gId], z_F[gId], lx, ly, lz);
     if (r > 4.0f) {
