@@ -68,7 +68,6 @@
 #define GROWTH_FR 1000
 #define DIVISION_FR 1000
 #define OUTPUT_FR 100
-
 #define MAX_ITERATIONS 1001
 #define MAX_CHEM_ITER  1000
 #define MAX_DEATH 60000
@@ -82,6 +81,12 @@
 // ghost band width in X, equal to the movement cell-center cull radius, so a rank
 // sees every partner that could act on a cell it owns
 #define GHOST_DEPTH_F 20.0f
+
+#define REBAL_MAX_PROCS 64
+#define REBALANCE_FR 100 // iterations between rebalances
+#define REBALANCE_TOL 0.02
+#define REBALANCE_GAIN 0.5
+#define REBALANCE_MAX_STEP 8
 
 // ghosts carry only the partner fields movement.cl reads
 #define GHOST_FLOATS_PER_CELL (3 * MAX_ELE + 3) // x,y,z blocks + xc,yc,zc
@@ -267,32 +272,275 @@ static int g_x_neighbour_left; // rank at smaller x, or MPI_PROC_NULL
 static int g_x_neighbour_right; // rank at larger x, or MPI_PROC_NULL
 static int g_rank, g_nprocs;
 
-// equal-width X bands over the occupied range; splitting the padded domain would
-// hand the end ranks mostly empty bands
-static void assign_x_band(void)
-{
-    float occupied = g_cell_hi_x - g_cell_lo_x;
-    float band = occupied / (float)g_nprocs;
 
-    // halos only reach the immediate neighbours and migration only hands a cell one
-    // band over, so a band narrower than the cull radius would silently lose forces
-    // and drop cells that cross two bands in a step
-    if (g_nprocs > 1 && band < GHOST_DEPTH_F)
+static int g_xcut[REBAL_MAX_PROCS + 1];
+static int g_x_imin, g_x_imax; // this rank's chem slice range
+static int g_min_w; // the halo safety floor on a band, in chem slices
+
+// derive this rank's band from the global cut array
+static void apply_x_cuts(const int * cut)
+{
+    for (int r = 0; r <= g_nprocs; r++) g_xcut[r] = cut[r];
+
+    g_x_imin = cut[g_rank];
+    g_x_imax = cut[g_rank + 1];
+    g_x_lo = g_chem_ox + (float)cut[g_rank] * g_dx;
+    g_x_hi = g_chem_ox + (float)cut[g_rank + 1] * g_dx;
+
+    if (g_rank == 0) { g_x_lo = 0.0f; g_x_imin = 0; }
+    if (g_rank == g_nprocs - 1) { g_x_hi = g_lx; g_x_imax = g_nx; }
+}
+
+// split into P contiguous bands so the heaviest band is as light as possible
+static int balanced_cuts(const long long * pre, int nslice, int P, int min_w, int * cut)
+{
+    if (P == 1) { cut[0] = 0; cut[1] = nslice; return 1; }
+    if ((long long)P * min_w > nslice) return 0;
+
+    const long long INF = pre[nslice] + 1; // a band can never outweigh the whole domain
+
+    long long * dp = (long long *)malloc((size_t)(P + 1) * (nslice + 1) * sizeof(long long));
+    int * back = (int *)malloc((size_t)(P + 1) * (nslice + 1) * sizeof(int));
+    assert(dp && back);
+#define DP(p, k) dp[(size_t)(p) * (nslice + 1) + (k)]
+#define BACK(p, k) back[(size_t)(p) * (nslice + 1) + (k)]
+
+    for (int k = 0; k <= nslice; k++)
+    {
+        DP(1, k) = (k >= min_w) ? pre[k] : INF;
+        BACK(1, k) = 0;
+    }
+    for (int p = 2; p <= P; p++)
+    {
+        for (int k = 0; k <= nslice; k++)
+        {
+            DP(p, k) = INF;
+            BACK(p, k) = -1;
+
+            int jmin = (p - 1) * min_w;
+            int jmax = k - min_w;
+            for (int j = jmin; j <= jmax; j++)
+            {
+                if (DP(p - 1, j) >= INF) continue;
+                long long last = pre[k] - pre[j];
+                long long m = (DP(p - 1, j) > last) ? DP(p - 1, j) : last;
+                if (m < DP(p, k)) { DP(p, k) = m; BACK(p, k) = j; }
+            }
+        }
+    }
+
+    int ok = (DP(P, nslice) < INF);
+    if (ok)
+    {
+        int k = nslice;
+        cut[P] = nslice;
+        for (int p = P; p >= 1; p--) { cut[p - 1] = BACK(p, k); k = cut[p - 1]; }
+        cut[0] = 0;
+    }
+#undef DP
+#undef BACK
+    free(dp);
+    free(back);
+    return ok;
+}
+
+// equal width bands, the fallback when the width floor makes balancing infeasible
+static void equal_width_cuts(int nslice, int P, int * cut)
+{
+    for (int r = 0; r <= P; r++) cut[r] = (int)((long long)r * nslice / P);
+}
+
+// Work balanced X partition
+static void assign_x_cuts_balanced(const float * x, const float * y, const float * z,
+                                   const int * ele_per_cell, int cell_no)
+{
+    int P = g_nprocs;
+    int nslice = g_nx;
+
+    if (P > REBAL_MAX_PROCS)
     {
         if (g_rank == 0)
-            fprintf(stderr, "[mpi] %d ranks gives an X band of %.2f, below the %.2f halo depth. "
-                            "use at most %d ranks for an occupied width of %.2f\n",
-                    g_nprocs, band, (float)GHOST_DEPTH_F,
-                    (int)(occupied / GHOST_DEPTH_F), occupied);
+            fprintf(stderr, "[mpi] %d ranks exceeds REBAL_MAX_PROCS = %d\n", P, REBAL_MAX_PROCS);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    g_x_lo = g_cell_lo_x + band * (float)g_rank;
-    g_x_hi = g_cell_lo_x + band * (float)(g_rank + 1);
+    g_min_w = (int)ceilf(GHOST_DEPTH_F / g_dx);
+    if (g_min_w < 1) g_min_w = 1;
 
-    // the end bands stay open so anything drifting into the padding is still owned
-    if (g_rank == 0) g_x_lo = 0.0f;
-    if (g_rank == g_nprocs - 1) g_x_hi = g_lx;
+    int * cut = (int *)malloc((size_t)(P + 1) * sizeof(int));
+    long long * pre = (long long *)calloc((size_t)nslice + 1, sizeof(long long));
+    long long * cpre = (long long *)calloc((size_t)nslice + 1, sizeof(long long));
+    float * cx = (float *)malloc((size_t)cell_no * sizeof(float));
+    float * cy = (float *)malloc((size_t)cell_no * sizeof(float));
+    float * cz = (float *)malloc((size_t)cell_no * sizeof(float));
+    int * ck = (int *)malloc((size_t)cell_no * sizeof(int));
+    assert(cut && pre && cpre && cx && cy && cz && ck);
+
+    float lo_x = 0.0f, hi_x = 0.0f, lo_y = 0.0f, hi_y = 0.0f, lo_z = 0.0f, hi_z = 0.0f;
+    int seen = 0;
+    for (int ci = 0; ci < cell_no; ci++)
+    {
+        ck[ci] = -1;
+        int n = ele_per_cell[ci];
+        if (n <= 0) continue;
+
+        float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+        for (int j = 0; j < n; j++)
+        {
+            int e = ci * MAX_ELE + j;
+            sx += x[e]; sy += y[e]; sz += z[e];
+        }
+        cx[ci] = sx / (float)n;
+        cy[ci] = sy / (float)n;
+        cz[ci] = sz / (float)n;
+
+        if (!seen)
+        {
+            lo_x = hi_x = cx[ci]; lo_y = hi_y = cy[ci]; lo_z = hi_z = cz[ci];
+            seen = 1;
+        }
+        else
+        {
+            if (cx[ci] < lo_x) lo_x = cx[ci];
+            if (cx[ci] > hi_x) hi_x = cx[ci];
+            if (cy[ci] < lo_y) lo_y = cy[ci];
+            if (cy[ci] > hi_y) hi_y = cy[ci];
+            if (cz[ci] < lo_z) lo_z = cz[ci];
+            if (cz[ci] > hi_z) hi_z = cz[ci];
+        }
+
+        int k = (int)floorf((cx[ci] - g_chem_ox) / g_dx);
+        if (k < 0) k = 0;
+        if (k >= nslice) k = nslice - 1;
+        ck[ci] = k;
+    }
+
+    int nbx = 1, nby = 1, nbz = 1;
+    float ox = 0.0f, oy = 0.0f, oz = 0.0f;
+    int * bin_ele = NULL;
+    int * c_bx = (int *)malloc((size_t)cell_no * sizeof(int));
+    int * c_by = (int *)malloc((size_t)cell_no * sizeof(int));
+    int * c_bz = (int *)malloc((size_t)cell_no * sizeof(int));
+    assert(c_bx && c_by && c_bz);
+
+    if (seen)
+    {
+        ox = lo_x - BIN_SIZE;
+        oy = lo_y - BIN_SIZE;
+        oz = lo_z - BIN_SIZE;
+        nbx = (int)ceilf((hi_x + BIN_SIZE - ox) / BIN_SIZE);
+        nby = (int)ceilf((hi_y + BIN_SIZE - oy) / BIN_SIZE);
+        nbz = (int)ceilf((hi_z + BIN_SIZE - oz) / BIN_SIZE);
+        if (nbx < 1) nbx = 1;
+        if (nby < 1) nby = 1;
+        if (nbz < 1) nbz = 1;
+    }
+    bin_ele = (int *)calloc((size_t)nbx * nby * nbz, sizeof(int));
+    assert(bin_ele);
+
+    for (int ci = 0; ci < cell_no; ci++)
+    {
+        if (ck[ci] < 0) continue;
+        int bx = (int)floorf((cx[ci] - ox) / BIN_SIZE);
+        int by = (int)floorf((cy[ci] - oy) / BIN_SIZE);
+        int bz = (int)floorf((cz[ci] - oz) / BIN_SIZE);
+        if (bx < 0) bx = 0; else if (bx >= nbx) bx = nbx - 1;
+        if (by < 0) by = 0; else if (by >= nby) by = nby - 1;
+        if (bz < 0) bz = 0; else if (bz >= nbz) bz = nbz - 1;
+        c_bx[ci] = bx; c_by[ci] = by; c_bz[ci] = bz;
+        bin_ele[(size_t)bx + (size_t)by * nbx + (size_t)bz * nbx * nby] += ele_per_cell[ci];
+    }
+
+    for (int ci = 0; ci < cell_no; ci++)
+    {
+        if (ck[ci] < 0) continue;
+
+        long long neigh = 0;
+        for (int dz = -1; dz <= 1; dz++)
+        {
+            int bz = c_bz[ci] + dz;
+            if (bz < 0 || bz >= nbz) continue;
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                int by = c_by[ci] + dy;
+                if (by < 0 || by >= nby) continue;
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    int bx = c_bx[ci] + dx;
+                    if (bx < 0 || bx >= nbx) continue;
+                    neigh += bin_ele[(size_t)bx + (size_t)by * nbx + (size_t)bz * nbx * nby];
+                }
+            }
+        }
+
+        long long w = (long long)ele_per_cell[ci] * neigh;
+        if (w < 1) w = 1; // an isolated cell still costs its own work items
+        pre[ck[ci] + 1] += w;
+        cpre[ck[ci] + 1] += 1;
+    }
+    for (int k = 0; k < nslice; k++) { pre[k + 1] += pre[k]; cpre[k + 1] += cpre[k]; }
+
+    free(cx); free(cy); free(cz); free(ck);
+    free(c_bx); free(c_by); free(c_bz); free(bin_ele);
+
+    int balanced = balanced_cuts(pre, nslice, P, g_min_w, cut);
+    if (!balanced)
+    {
+        equal_width_cuts(nslice, P, cut);
+        if (P > 1 && nslice / P < g_min_w)
+        {
+            if (g_rank == 0)
+                fprintf(stderr, "[mpi] %d ranks over %d chem slices gives a band below the "
+                                "%d slice halo floor. use at most %d ranks\n",
+                        P, nslice, g_min_w, nslice / g_min_w);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    apply_x_cuts(cut);
+
+    if (g_rank == 0)
+    {
+        long long wtot = pre[nslice], ctot = cpre[nslice];
+        printf("[balance] work balanced X partition: %d slices of %.3f, min band %d%s\n",
+               nslice, g_dx, g_min_w, balanced ? "" : "  [INFEASIBLE, equal width fallback]");
+
+        double maxshare = 0.0;
+        for (int r = 0; r < P; r++)
+        {
+            long long w = pre[cut[r + 1]] - pre[cut[r]];
+            long long c = cpre[cut[r + 1]] - cpre[cut[r]];
+            double ws = wtot ? 100.0 * (double)w / (double)wtot : 0.0;
+            if (ws > maxshare) maxshare = ws;
+            printf("[balance]   rank %d: slices [%d,%d) n=%d  cells=%lld (%.1f%%)  work=%.1f%%\n",
+                   r, cut[r], cut[r + 1], cut[r + 1] - cut[r], c,
+                   ctot ? 100.0 * (double)c / (double)ctot : 0.0, ws);
+        }
+
+        long long peak = 0;
+        int peak_k = 0;
+        for (int k = 0; k < nslice; k++)
+        {
+            long long sw = pre[k + 1] - pre[k];
+            if (sw > peak) { peak = sw; peak_k = k; }
+        }
+        double ideal = 100.0 / (double)P;
+        printf("[balance]   ideal %.1f%%, achieved max %.1f%%, headroom %d slices; "
+               "peak slice %d = %.1f%%%s\n",
+               ideal, maxshare, nslice - P * g_min_w, peak_k,
+               wtot ? 100.0 * (double)peak / (double)wtot : 0.0,
+               (maxshare > 1.5 * ideal) ? "  [1-D X cannot balance further]" : "");
+
+#if REBALANCE_FR > 0
+        if (REBALANCE_MAX_STEP >= g_min_w)
+            fprintf(stderr, "[balance] WARNING: REBALANCE_MAX_STEP %d >= min band %d, "
+                            "a rebalance could push a cell past its neighbour\n",
+                    (int)REBALANCE_MAX_STEP, g_min_w);
+#endif
+        fflush(stdout);
+    }
+
+    free(pre); free(cpre); free(cut);
 }
 
 static const float R_Diff = 0.01; // probability that a slow-dividing cell gives birth to a fast-divising daughter
@@ -1329,6 +1577,13 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         assert(err == CL_SUCCESS);
     }
 
+#if REBALANCE_FR > 0
+    double t_local_prev = 0.0;
+    double t_rebal = 0.0;
+    int n_rebal = 0;
+    long long n_slices_moved = 0;
+#endif
+
     // start of time iterations
     int iterations = MAX_ITERATIONS;
     double t_loop0 = MPI_Wtime();
@@ -2088,6 +2343,85 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             assert(err == CL_SUCCESS);
         }
 
+        // Dynamic rebalance
+#if REBALANCE_FR > 0
+        if (g_nprocs > 1 && iter > 0 && iter % REBALANCE_FR == 0)
+        {
+            double t_rb0 = MPI_Wtime();
+
+            double t_local = (MPI_Wtime() - t_loop0) - (t_comm + g_output_comm) - g_output_io;
+            double d_local = t_local - t_local_prev;
+            t_local_prev = t_local;
+
+            double tv[REBAL_MAX_PROCS];
+            t_comm0 = MPI_Wtime();
+            MPI_Allgather(&d_local, 1, MPI_DOUBLE, tv, 1, MPI_DOUBLE, MPI_COMM_WORLD);
+            t_comm += MPI_Wtime() - t_comm0;
+
+            int newcut[REBAL_MAX_PROCS + 1];
+            for (int r = 0; r <= g_nprocs; r++) newcut[r] = g_xcut[r];
+
+            if (g_rank == 0)
+            {
+                for (int b = 1; b < g_nprocs; b++)
+                {
+                    double lo = tv[b - 1], hi = tv[b]; // below / above cut b
+                    if (lo <= 0.0 || hi <= 0.0) continue; // no signal yet
+
+                    double mean = 0.5 * (lo + hi);
+                    double imb = (lo - hi) / mean;
+                    if (fabs(imb) < REBALANCE_TOL) continue; // deadband
+
+                    // size the move from the slower side's average work per slice
+                    double w_slow = (imb > 0.0) ? (double)(newcut[b] - newcut[b - 1])
+                                                : (double)(newcut[b + 1] - newcut[b]);
+                    double slow = (imb > 0.0) ? lo : hi;
+                    double raw = REBALANCE_GAIN * w_slow * fabs(lo - hi) / (2.0 * slow);
+
+                    int step = (int)(raw + 0.5);
+                    if (step < 1) step = 1; // past the deadband, always move
+                    if (step > REBALANCE_MAX_STEP) step = REBALANCE_MAX_STEP;
+                    if (imb < 0.0) step = -step; // rank b is the slower one, grow b-1
+					
+                    int lo_limit = newcut[b - 1] + g_min_w;
+                    int hi_limit = newcut[b + 1] - g_min_w;
+                    if (lo_limit > hi_limit) continue; // no legal position left
+
+                    int nc = newcut[b] - step;
+                    if (nc < lo_limit) nc = lo_limit;
+                    if (nc > hi_limit) nc = hi_limit;
+                    newcut[b] = nc;
+                }
+            }
+            t_comm0 = MPI_Wtime();
+            MPI_Bcast(newcut, g_nprocs + 1, MPI_INT, 0, MPI_COMM_WORLD);
+            t_comm += MPI_Wtime() - t_comm0;
+
+            int moved = 0;
+            for (int r = 0; r <= g_nprocs; r++) moved += abs(newcut[r] - g_xcut[r]);
+
+            if (moved)
+            {
+                if (g_rank == 0)
+                {
+                    printf("[REBAL] iter=%d moved=%d cuts=[", iter, moved);
+                    for (int r = 0; r <= g_nprocs; r++)
+                        printf("%d%s", newcut[r], (r < g_nprocs) ? "," : "");
+                    printf("] compute_s=[");
+                    for (int r = 0; r < g_nprocs; r++)
+                        printf("%.2f%s", tv[r], (r < g_nprocs - 1) ? "," : "");
+                    printf("]\n");
+                    fflush(stdout);
+                }
+
+                apply_x_cuts(newcut);
+                n_rebal++;
+                n_slices_moved += moved;
+            }
+            t_rebal += MPI_Wtime() - t_rb0;
+        }
+#endif
+
         // migration: a cell whose centre has left my band is handed to the neighbour.
         // end ranks keep theirs, the outer side being MPI_PROC_NULL
         if (g_nprocs > 1)
@@ -2220,8 +2554,11 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             float * recv_lo = (float *)malloc(nyz * sizeof(float));
             float * recv_hi = (float *)malloc(nyz * sizeof(float));
 
-            int i_lo = (int)((g_x_lo - g_chem_ox) / g_dx);
-            int i_hi = (int)((g_x_hi - g_chem_ox) / g_dx) - 1;
+            // straight off the cut array. deriving these from the float band edges
+            // instead used to go negative on rank 0, whose g_x_lo is clamped to 0
+            // while g_chem_ox sits at pad_x - CHEM_MARGIN
+            int i_lo = g_x_imin;
+            int i_hi = g_x_imax - 1;
 
             for (int jy = 0; jy < g_ny; jy++)
                 for (int kz = 0; kz < g_nz; kz++)
@@ -2325,6 +2662,12 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     }
 
     double t_loop_end = MPI_Wtime();
+
+#if REBALANCE_FR > 0
+    if (g_rank == 0 && g_nprocs > 1)
+        printf("[REBAL] %d rebalance(s), %lld slice(s) moved, %.3f s in the rebalance path\n",
+               n_rebal, n_slices_moved, t_rebal);
+#endif
 
     *out_setup      = t_loop0 - t_func_start;
     *out_loop       = t_loop_end - t_loop0;
@@ -2622,15 +2965,11 @@ int main (int argc, char * argv[]) {
         MPI_Cart_shift(cart, 0, 1, &g_x_neighbour_left, &g_x_neighbour_right);
         MPI_Comm_free(&cart);
     }
-    assign_x_band();
 
-    if (g_rank == 0) printf("[mpi] %d rank(s), X band %.2f over occupied [%.2f, %.2f) of lx %.2f\n",
-                            g_nprocs, (g_cell_hi_x - g_cell_lo_x) / (float)g_nprocs,
-                            g_cell_lo_x, g_cell_hi_x, g_lx);
+    if (g_rank == 0) printf("[mpi] %d rank(s) over occupied [%.2f, %.2f) of lx %.2f\n",
+                            g_nprocs, g_cell_lo_x, g_cell_hi_x, g_lx);
     if (g_rank == 0) printf("[grid] bins %dx%dx%d = %d, chem %dx%dx%d = %d\n",
                             g_nbx, g_nby, g_nbz, g_nbins, g_nx, g_ny, g_nz, g_nx*g_ny*g_nz);
-    printf("[rank %d] x band [%.2f, %.2f) left=%d right=%d\n",
-           g_rank, g_x_lo, g_x_hi, g_x_neighbour_left, g_x_neighbour_right);
 
     g_max_cell = (int)(sniff_cell_no * CELL_GROWTH);
 
@@ -2734,6 +3073,12 @@ int main (int argc, char * argv[]) {
             z[k] += g_shift_z;
         }
     }
+
+    assign_x_cuts_balanced(x, y, z, ele_per_cell, cell_no);
+
+    printf("[rank %d] x band [%.2f, %.2f) chem slices [%d, %d) left=%d right=%d\n",
+           g_rank, g_x_lo, g_x_hi, g_x_imin, g_x_imax,
+           g_x_neighbour_left, g_x_neighbour_right);
 
     // every rank reads the whole IC, then drops the cells outside its own X band.
     // the two end bands are open ended, so nothing drifting into the padding is lost.
