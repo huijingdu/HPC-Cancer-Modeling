@@ -2438,6 +2438,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                     if (step < 1) step = 1; // past the deadband, always move
                     if (step > REBALANCE_MAX_STEP) step = REBALANCE_MAX_STEP;
                     if (imb < 0.0) step = -step; // rank b is the slower one, grow b-1
+					
                     int lo_limit = newcut[b - 1] + g_min_w;
                     int hi_limit = newcut[b + 1] - g_min_w;
                     if (lo_limit > hi_limit) continue; // no legal position left
