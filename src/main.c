@@ -88,6 +88,16 @@
 #define REBALANCE_GAIN 0.5
 #define REBALANCE_MAX_STEP 8
 
+// 0 = the proportional rule below
+// 1 = the GRU in rnn/rnn_balancer.c
+#define REBAL_CONTROLLER 1
+
+#if REBALANCE_FR > 0 && REBAL_CONTROLLER == 1
+    #include "rnn/rnn_balancer.h"
+
+    #define REBAL_RNN_WEIGHTS "rnn/rnn_weights.txt"// scanned once at startup
+#endif
+
 // ghosts carry only the partner fields movement.cl reads
 #define GHOST_FLOATS_PER_CELL (3 * MAX_ELE + 3) // x,y,z blocks + xc,yc,zc
 #define GHOST_INTS_PER_CELL 2 // ele_per_cell, cell_type
@@ -1586,6 +1596,25 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
     // start of time iterations
     int iterations = MAX_ITERATIONS;
+#if REBALANCE_FR > 0 && REBAL_CONTROLLER == 1
+    RebalRNN *rnn_ctl = (g_rank == 0 && g_nprocs > 1)
+                      ? rebal_rnn_create(g_nprocs, REBAL_RNN_WEIGHTS) : NULL;
+    if (g_rank == 0)
+    {
+        if (rnn_ctl)
+            printf("[rebal] RNN controller active from %s: %d features, "
+                   "max_step %d vs min_w %d%s\n",
+                   REBAL_RNN_WEIGHTS, rebal_rnn_n_features(), rebal_rnn_max_step(),
+                   g_min_w,
+                   (rebal_rnn_max_step() < g_min_w) ? "" : "  [WARNING: step >= min_w, "
+                   "migration may not be single-hop]");
+        else
+            printf("[rebal] RNN controller UNAVAILABLE (could not load %s), "
+                   "falling back to the heuristic\n", REBAL_RNN_WEIGHTS);
+        fflush(stdout);
+    }
+#endif
+
     double t_loop0 = MPI_Wtime();
     for(int iter = 0; iter < iterations; iter++)
     {
@@ -2358,11 +2387,38 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             MPI_Allgather(&d_local, 1, MPI_DOUBLE, tv, 1, MPI_DOUBLE, MPI_COMM_WORLD);
             t_comm += MPI_Wtime() - t_comm0;
 
+            // [REBAL] below only prints when a cut moves, which hides the
+            // intervals where the controller correctly did nothing
+            if (g_rank == 0)
+            {
+                double sum = 0.0, mx = 0.0;
+                for (int r = 0; r < g_nprocs; r++)
+                { sum += tv[r]; if (tv[r] > mx) mx = tv[r]; }
+                double mean = sum / g_nprocs;
+                printf("[RBLOG] iter=%d imb=%.4f cuts=[", iter,
+                       (mean > 0.0) ? (mx - mean) / mean : 0.0);
+                for (int r = 0; r <= g_nprocs; r++)
+                    printf("%d%s", g_xcut[r], (r < g_nprocs) ? "," : "");
+                printf("] t=[");
+                for (int r = 0; r < g_nprocs; r++)
+                    printf("%.4f%s", tv[r], (r < g_nprocs - 1) ? "," : "");
+                printf("]\n");
+                fflush(stdout);
+            }
+
             int newcut[REBAL_MAX_PROCS + 1];
             for (int r = 0; r <= g_nprocs; r++) newcut[r] = g_xcut[r];
 
             if (g_rank == 0)
             {
+#if REBAL_CONTROLLER == 1
+              // returns cuts already legalized the same way as the rule below.
+              // iter / REBALANCE_FR is the event index the phase features need
+              if (rnn_ctl) {
+                rebal_rnn_decide(rnn_ctl, tv, g_xcut, g_nx, g_min_w,
+                                 iter / REBALANCE_FR, NULL, newcut);
+              } else
+#endif
                 for (int b = 1; b < g_nprocs; b++)
                 {
                     double lo = tv[b - 1], hi = tv[b]; // below / above cut b
@@ -2667,6 +2723,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     if (g_rank == 0 && g_nprocs > 1)
         printf("[REBAL] %d rebalance(s), %lld slice(s) moved, %.3f s in the rebalance path\n",
                n_rebal, n_slices_moved, t_rebal);
+#if REBALANCE_FR > 0 && REBAL_CONTROLLER == 1
+    rebal_rnn_destroy(rnn_ctl);
+#endif
 #endif
 
     *out_setup      = t_loop0 - t_func_start;
