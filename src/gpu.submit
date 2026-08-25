@@ -4,9 +4,9 @@
 #SBATCH --job-name=test_cancer_code
 #SBATCH --error=job.%J.err
 #SBATCH --output=job.%J.out
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=2
-#SBATCH --partition=gpu --gres=gpu:2
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --partition=gpu --gres=gpu:1
 
 module load compiler/gcc/9 cuda/12.2 openmpi
 export PSM2_CUDA=0 # Omni-Path: keep CUDA buffers out of MPI
@@ -16,6 +16,6 @@ make
 mkdir -p PQR
 command -v lfs > /dev/null && lfs setstripe -c 8 -S 4m PQR 2> /dev/null
 
-for ic in Input/IC_60K; do
+for ic in Input/IC; do
     mpirun -np "$SLURM_NTASKS" ./aa "$ic"
 done
