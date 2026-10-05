@@ -18,13 +18,8 @@
 #define NF_BASE 13
 #define NF_FULL 16
 
-// must match main.c: only used to rebuild the step the residual corrects
-#ifndef REBALANCE_TOL
-#define REBALANCE_TOL   0.02
-#endif
-#ifndef REBALANCE_GAIN
-#define REBALANCE_GAIN  0.5
-#endif
+#define RNN_HEUR_TOL   0.02
+#define RNN_HEUR_GAIN  0.5
 
 // shape and weights, all scanned from the file at startup
 static int    g_nf, g_nh, g_max_step, g_steps_per_growth;
@@ -219,12 +214,12 @@ double rebal_rnn_heuristic_step(double t_lo, double t_hi, int w_lo, int w_hi)
     double mean = 0.5 * (t_lo + t_hi);
     if (mean < 1e-12) mean = 1e-12;
     double imb = (t_lo - t_hi) / mean;
-    if (fabs(imb) < REBALANCE_TOL) return 0.0; // deadband
+    if (fabs(imb) < RNN_HEUR_TOL) return 0.0; // deadband
 
     double w_slow = (imb > 0.0) ? (double)w_lo : (double)w_hi;
     double slow   = (imb > 0.0) ? t_lo : t_hi;
     if (slow < 1e-12) slow = 1e-12;
-    double raw = REBALANCE_GAIN * w_slow * fabs(t_lo - t_hi) / (2.0 * slow);
+    double raw = RNN_HEUR_GAIN * w_slow * fabs(t_lo - t_hi) / (2.0 * slow);
 
     double step = floor(raw + 0.5);
     if (step < 1.0) step = 1.0; // always move once
