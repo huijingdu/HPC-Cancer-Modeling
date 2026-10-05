@@ -1,0 +1,11 @@
+# Binary files
+*.o
+*.exe
+src/aa
+
+# Simulation files
+src/Input
+PQR/
+
+# Development environment configuration
+.vscode/
