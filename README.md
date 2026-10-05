@@ -3,6 +3,7 @@
 **High-Performance Computing (HPC) for Large-Scale 3D Multiscale Cancer Simulations**
 
 ## Overview
+
 This repository implements a spatial multiscale modeling framework for cancer research. The model integrates **discrete agent-based cells** in a 3D environment with **continuum distributions** (such as calcium or nutrient gradients). The implementation focuses on transitioning complex Subcellular Element Models (SEM) into high-performance GPU and CPU code to achieve large-scale biological realism.
 
 For a detailed mathematical background, please refer to the primary publication: "Skin" Paper (Refer to Page 5 for the 3D multiscale model and Pages 19-21 for the Subcellular element model to GPU implementation logic).
@@ -10,19 +11,23 @@ For a detailed mathematical background, please refer to the primary publication:
 ---
 
 ## Demo: Cell Movement Logic
+
 The current demo version focuses on cell motility driven by interaction forces. The execution pipeline:
 
-1.  **Memory Management:** Initialization and allocation of data structures at both the Host (CPU) and Device (GPU) levels.
-2.  **Initial Conditions:** The model reads from `Input/IC` to establish the starting state (typically a single layer of ~60 Type 1 cells).
-3.  **Simulation Loop:** * Iterative updates of cell coordinates based on calculated interaction forces.
-   * Periodic data output every 100 steps for trajectory analysis.
-4.  **Finalization:** Memory cleanup and resource deallocation upon reaching the maximum iteration step.
+1. **Memory Management:** Initialization and allocation of data structures at both the Host (CPU) and Device (GPU) levels.
+2. **Initial Conditions:** The model reads from `Input/IC` to establish the starting state (typically a single layer of ~60 Type 1 cells).
+3. **Simulation Loop:** * Iterative updates of cell coordinates based on calculated interaction forces.
+
+* Periodic data output every 100 steps for trajectory analysis.
+
+4. **Finalization:** Memory cleanup and resource deallocation upon reaching the maximum iteration step.
 
 ---
 
 ## HPC Implementation
 
 ### Prerequisites
+
 The environment must be configured with the appropriate compiler, OpenCL and MPI drivers. On the HPC cluster, load the following modules:
 
 ```bash
@@ -30,6 +35,7 @@ module load compiler/gcc/9 cuda/12.2 openmpi/4.1
 ```
 
 ### Model Training
+
 The model can be used without training due to the existing `src/rnn/rnn_weights.txt`. To retrain the model, prerequisites must be loaded via:
 
 ```bash
@@ -46,6 +52,7 @@ python3 train/train_rnn.py
 This trains the model at 6,000 steps with the base features.
 
 ### Compilation
+
 The project includes a Makefile to automate the build process. To compile the code, run:
 
 ```bash
@@ -54,6 +61,7 @@ make
 ```
 
 ### Job Submission
+
 To submit a Slurm job, use the included `gpu.submit` script:
 
 ```bash
@@ -76,7 +84,16 @@ The program screens the environment and uses all of the available GPUs, so defin
 ```text
 HPC-Cancer-Modeling/
 ├── src/                    # Source code directory
-│   ├── main.c              # Main entry point
+│   ├── main.c              # Entry point: IC load, domain setup, MPI decomposition
+│   ├── sim.c/.h            # Simulation loop
+│   ├── ocl_setup.c/.h      # OpenCL context, kernels, buffers, kernel args, teardown
+│   ├── halo.c/.h           # Ghost and migrant cell exchange between ranks
+│   ├── domain.c/.h         # Bin grid fit and X-axis work-balanced partition
+│   ├── biology.c/.h        # Cell lineage and chemical initialization
+│   ├── io.c/.h             # IC reading and PQR output
+│   ├── sim_globals.c/.h    # Compile-time constants and process-wide globals
+│   ├── sim_types.h         # Cell, element and chem array structs
+│   ├── mpi_assert.h        # assert() that aborts the whole MPI job
 │   ├── binning.cl          # OpenCL kernels
 │   ├── cellcenter.cl
 │   ├── chem_rk_gpu.cl
