@@ -91,6 +91,13 @@
 // sees every partner that could act on a cell it owns
 #define GHOST_DEPTH_F 20.0f
 
+// initial X partition, allows tuning during compile time
+// 0 for workload-aware cuts
+// 1 for equal-width cuts
+#ifndef PARTITION
+#define PARTITION 0
+#endif
+
 #define REBAL_MAX_PROCS 64
 #define REBALANCE_FR 100 // iterations between rebalances
 #define REBALANCE_TOL 0.02
@@ -502,18 +509,20 @@ static void assign_x_cuts_balanced(const float * x, const float * y, const float
     free(cx); free(cy); free(cz); free(ck);
     free(c_bx); free(c_by); free(c_bz); free(bin_ele);
 
+#if PARTITION == 1
+    int balanced = 0;
+    equal_width_cuts(nslice, P, cut);
+#else
     int balanced = balanced_cuts(pre, nslice, P, g_min_w, cut);
-    if (!balanced)
+    if (!balanced) equal_width_cuts(nslice, P, cut);
+#endif
+    if (!balanced && P > 1 && nslice / P < g_min_w)
     {
-        equal_width_cuts(nslice, P, cut);
-        if (P > 1 && nslice / P < g_min_w)
-        {
-            if (g_rank == 0)
-                fprintf(stderr, "[mpi] %d ranks over %d chem slices gives a band below the "
-                                "%d slice halo floor. use at most %d ranks\n",
-                        P, nslice, g_min_w, nslice / g_min_w);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
+        if (g_rank == 0)
+            fprintf(stderr, "[mpi] %d ranks over %d chem slices gives a band below the "
+                            "%d slice halo floor. use at most %d ranks\n",
+                    P, nslice, g_min_w, nslice / g_min_w);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     apply_x_cuts(cut);
@@ -521,8 +530,13 @@ static void assign_x_cuts_balanced(const float * x, const float * y, const float
     if (g_rank == 0)
     {
         long long wtot = pre[nslice], ctot = cpre[nslice];
+#if PARTITION == 1
+        printf("[balance] uniform X partition: %d slices of %.3f, min band %d\n",
+               nslice, g_dx, g_min_w);
+#else
         printf("[balance] work balanced X partition: %d slices of %.3f, min band %d%s\n",
                nslice, g_dx, g_min_w, balanced ? "" : "  [INFEASIBLE, equal width fallback]");
+#endif
 
         double maxshare = 0.0;
         for (int r = 0; r < P; r++)
@@ -548,7 +562,7 @@ static void assign_x_cuts_balanced(const float * x, const float * y, const float
                "peak slice %d = %.1f%%%s\n",
                ideal, maxshare, nslice - P * g_min_w, peak_k,
                wtot ? 100.0 * (double)peak / (double)wtot : 0.0,
-               (maxshare > 1.5 * ideal) ? "  [1-D X cannot balance further]" : "");
+               (PARTITION == 0 && maxshare > 1.5 * ideal) ? "  [1-D X cannot balance further]" : "");
 
 #if REBALANCE_FR > 0
         if (REBALANCE_MAX_STEP >= g_min_w)
