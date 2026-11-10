@@ -729,6 +729,9 @@ static long long g_mig_cells = 0;
 static double g_mig_local = 0.0;
 static double g_mig_exchange = 0.0;
 
+// device time spent in the movement
+static double g_movement_kernel_s = 0.0;
+
 void output_mpi(float * x, float * y, float * z, float * xc, float * yc, float * zc, int * id, int * cell_type, int * ele_type, int cell_no, int ele_no, int * ele_per_cell, int step, float * chem1_gpu, float * chem2_gpu, int * cclock, int * cycle, int * flag_gener, float * vx, float * vy, float * vz)
 {
     // the cells this rank writes
@@ -1040,7 +1043,10 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 	{
     	context = clCreateContext(0, 1, &device_id, NULL, NULL, &err);
     	assert(err == CL_SUCCESS);
-    	cmd_queue = clCreateCommandQueueWithProperties(context, device_id, 0, NULL);
+        // profiling lets the movement kernel report its own device time
+        const cl_queue_properties qprops[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
+    	cmd_queue = clCreateCommandQueueWithProperties(context, device_id, qprops, &err);
+    	assert(err == CL_SUCCESS);
 	}
 
     // Bin buffer allocation (requires context)
@@ -1984,10 +1990,21 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         assert(err == CL_SUCCESS);
         // global_work_size = max_ele_no;
         global_work_size = combined_cell_no * MAX_ELE;
-        err = clEnqueueNDRangeKernel(cmd_queue, kernel[0], 1, NULL, 
-									 &global_work_size, NULL, 0, NULL, NULL);
+        cl_event movement_ev;
+        err = clEnqueueNDRangeKernel(cmd_queue, kernel[0], 1, NULL,
+									 &global_work_size, NULL, 0, NULL, &movement_ev);
         assert(err == CL_SUCCESS);
         clFinish(cmd_queue);
+
+        // device time of the interaction evaluation alone, free of host work and I/O
+        cl_ulong ev_start = 0, ev_end = 0;
+        err = clGetEventProfilingInfo(movement_ev, CL_PROFILING_COMMAND_START,
+                                      sizeof(ev_start), &ev_start, NULL);
+        err |= clGetEventProfilingInfo(movement_ev, CL_PROFILING_COMMAND_END,
+                                       sizeof(ev_end), &ev_end, NULL);
+        assert(err == CL_SUCCESS);
+        g_movement_kernel_s += (double)(ev_end - ev_start) * 1e-9;
+        clReleaseEvent(movement_ev);
 
         err = clEnqueueCopyBuffer(cmd_queue, x_mem, xo_mem, 0, 0, max_ele_no*sizeof(float),
                                   0, 0, NULL);
@@ -3274,10 +3291,11 @@ int main (int argc, char * argv[]) {
 
     // compute is the loop with the measured comm and io taken out
     printf("[TIMING] IC=%s rank=%d cells=%d setup=%.2f loop=%.2f comm=%.2f io=%.2f "
-           "compute=%.2f wall=%.2f s mig_cells=%lld mig_local=%.2f mig_exchange=%.2f\n",
+           "compute=%.2f wall=%.2f s mig_cells=%lld mig_local=%.2f mig_exchange=%.2f "
+           "movement_kernel=%.2f\n",
            InName, g_rank, cell_no, t_setup, t_loop, t_comm, t_io,
            t_loop - t_comm - t_io, t_setup + t_loop,
-           g_mig_cells, g_mig_local, g_mig_exchange);
+           g_mig_cells, g_mig_local, g_mig_exchange, g_movement_kernel_s);
     fflush(stdout);
 
 
