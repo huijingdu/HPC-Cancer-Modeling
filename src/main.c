@@ -106,7 +106,11 @@
 
 // 0 = the proportional rule below
 // 1 = the GRU in rnn/rnn_balancer.c
+// 2 = static: cuts stay frozen, but interval times are still logged
+#ifndef REBAL_CONTROLLER
 #define REBAL_CONTROLLER 1
+#endif
+
 
 #if REBALANCE_FR > 0 && REBAL_CONTROLLER == 1
     #include "rnn/rnn_balancer.h"
@@ -2432,6 +2436,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             int newcut[REBAL_MAX_PROCS + 1];
             for (int r = 0; r <= g_nprocs; r++) newcut[r] = g_xcut[r];
 
+            // static skips the decision only, so it keeps the same logging, Allgather
+            // and Bcast as the dynamic arms and differs from them in policy alone
+#if REBAL_CONTROLLER != 2
             if (g_rank == 0)
             {
 #if REBAL_CONTROLLER == 1
@@ -2472,6 +2479,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                     newcut[b] = nc;
                 }
             }
+#endif
             t_comm0 = MPI_Wtime();
             MPI_Bcast(newcut, g_nprocs + 1, MPI_INT, 0, MPI_COMM_WORLD);
             t_comm += MPI_Wtime() - t_comm0;
