@@ -723,6 +723,12 @@ void InitialReader(const char InName[], float * x, float * y, float * z, int * i
 static double g_output_io = 0.0;
 static double g_output_comm = 0.0;
 
+// cell hand-offs sent by this rank. local is packing, slot reuse and device
+// uploads; exchange is the Sendrecv calls, which also absorb neighbour waits
+static long long g_mig_cells = 0;
+static double g_mig_local = 0.0;
+static double g_mig_exchange = 0.0;
+
 void output_mpi(float * x, float * y, float * z, float * xc, float * yc, float * zc, int * id, int * cell_type, int * ele_type, int cell_no, int ele_no, int * ele_per_cell, int step, float * chem1_gpu, float * chem2_gpu, int * cclock, int * cycle, int * flag_gener, float * vx, float * vy, float * vz)
 {
     // the cells this rank writes
@@ -2533,6 +2539,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
         // end ranks keep theirs, the outer side being MPI_PROC_NULL
         if (g_nprocs > 1)
         {
+            double t_mig0 = MPI_Wtime();
             int n_mig_left = 0, n_mig_right = 0;
             for (int i = 0; i < local_cell_no; i++)
             {
@@ -2569,7 +2576,8 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
             MPI_Sendrecv(mig_right.send_i, n_mig_right * MIG_INTS_PER_CELL, MPI_INT, g_x_neighbour_right, 11,
                          mig_left.recv_i, n_arr_left * MIG_INTS_PER_CELL, MPI_INT, g_x_neighbour_left, 11,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            t_comm += MPI_Wtime() - t_comm0;
+            double t_mig_exchange = MPI_Wtime() - t_comm0;
+            t_comm += t_mig_exchange;
 
             // free the departed slots before placing arrivals, so a slot vacated this
             // step can be refilled this step
@@ -2646,6 +2654,10 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
                                            &flag_gener[slot], 0, NULL, NULL);
                 assert(err == CL_SUCCESS);
             }
+
+            g_mig_cells += n_mig_left + n_mig_right;
+            g_mig_exchange += t_mig_exchange;
+            g_mig_local += (MPI_Wtime() - t_mig0) - t_mig_exchange;
         }
 
 #if 0
@@ -3262,9 +3274,10 @@ int main (int argc, char * argv[]) {
 
     // compute is the loop with the measured comm and io taken out
     printf("[TIMING] IC=%s rank=%d cells=%d setup=%.2f loop=%.2f comm=%.2f io=%.2f "
-           "compute=%.2f wall=%.2f s\n",
+           "compute=%.2f wall=%.2f s mig_cells=%lld mig_local=%.2f mig_exchange=%.2f\n",
            InName, g_rank, cell_no, t_setup, t_loop, t_comm, t_io,
-           t_loop - t_comm - t_io, t_setup + t_loop);
+           t_loop - t_comm - t_io, t_setup + t_loop,
+           g_mig_cells, g_mig_local, g_mig_exchange);
     fflush(stdout);
 
 
