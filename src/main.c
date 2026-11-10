@@ -1651,6 +1651,17 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     }
 #endif
 
+    // the compile-time switches, so every log names the arm it belongs to
+    if (g_rank == 0)
+    {
+        printf("[config] SEED=%d DEVICE_TYPE=%s PARTITION=%d REBAL_CONTROLLER=%d "
+               "REBALANCE_FR=%d ALLPAIRS=%d MAX_ITERATIONS=%d\n",
+               (int)SEED, (DEVICE_TYPE == CL_DEVICE_TYPE_CPU) ? "CPU" : "GPU",
+               (int)PARTITION, (int)REBAL_CONTROLLER, (int)REBALANCE_FR,
+               (int)ALLPAIRS, (int)MAX_ITERATIONS);
+        fflush(stdout);
+    }
+
     double t_loop0 = MPI_Wtime();
     for(int iter = 0; iter < iterations; iter++)
     {
