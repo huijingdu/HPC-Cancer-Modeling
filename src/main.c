@@ -49,6 +49,13 @@
 #define DEVICE_TYPE CL_DEVICE_TYPE_GPU
 #endif
 
+// inter-cell candidate search in movement.cl, allows tuning during compile time
+// 0 = the 27-bin neighbourhood of each cell centre
+// 1 = all-pairs reference, every cell is a candidate
+#ifndef ALLPAIRS
+#define ALLPAIRS 0
+#endif
+
 #define BIN_SIZE 12.0f
 #define g_dx_TARGET 1.0f
 #define PAD 5.0f
@@ -1047,7 +1054,9 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     	program[0] = clCreateProgramWithSource(context, 1, (const char**)&program_source,
 											   NULL, &err);
     	assert(err == CL_SUCCESS);
-    	err = clBuildProgram(program[0], 0, NULL, NULL, NULL, NULL);
+        // the kernel source cannot see host macros, so the search mode goes in as a build option
+        const char * movement_opts = ALLPAIRS ? "-DALLPAIRS=1" : "-DALLPAIRS=0";
+    	err = clBuildProgram(program[0], 0, NULL, movement_opts, NULL, NULL);
     	assert(err == CL_SUCCESS);
 
         char build[2048];

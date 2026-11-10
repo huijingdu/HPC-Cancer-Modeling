@@ -108,6 +108,46 @@ float distance3_new(float dx, float dy, float dz)
     return sqrt(dx*dx + dy*dy + dz*dz) + 0.0001;
 }
 
+// force on element gId of cell cellId from every element of partner cell k.
+// shared by the binned and all-pairs searches, so the two differ only in
+// which partners they visit
+void partner_force(int gId, int cellId, int k, int max_ele,
+                   __global const float * x, __global const float * y, __global const float * z,
+                   __global const float * xc, __global const float * yc, __global const float * zc,
+                   __global const int * ele_per_cell, __global const int * cell_type,
+                   float * x_F1, float * y_F1, float * z_F1)
+{
+    // cell-cell cull: reject the whole 20x20 element block cheaply
+    float dist = 20.0f;
+    float x_dist = fabs(xc[cellId] - xc[k]);
+    if (x_dist > dist) return;
+    float y_dist = fabs(yc[cellId] - yc[k]);
+    if (y_dist > dist) return;
+    float z_dist = fabs(zc[cellId] - zc[k]);
+    if (distance3_new(x_dist, y_dist, z_dist) > dist) return;
+
+    for (int j = 0; j < ele_per_cell[k]; ++j) {
+        int i = k * max_ele + j;
+        x_dist = x[gId] - x[i];
+        y_dist = y[gId] - y[i];
+        z_dist = z[gId] - z[i];
+        float r = distance3_new(x_dist, y_dist, z_dist);
+        if (r >= 12.0f) continue; // inter potentials are 0 past 12
+
+        float V;
+        if (cell_type[cellId] == cell_type[k]) {
+            V = inter_potential_same(r, x[gId], y[gId], z[gId], x_F1, y_F1, z_F1);
+        } else if ((cell_type[cellId] + cell_type[k]) == 3) {
+            V = inter_potential_01(r, x[gId], y[gId], z[gId], x_F1, y_F1, z_F1);
+        } else {
+            V = inter_potential(r, x[gId], y[gId], z[gId], x_F1, y_F1, z_F1);
+        }
+        *x_F1 += V * x_dist;
+        *y_F1 += V * y_dist;
+        *z_F1 += V * z_dist;
+    }
+}
+
 //Kernel for cell movement using subcellular element model
 //The code returns the force for element[gId] of cell[cellId].
 __kernel void movement(
@@ -168,6 +208,14 @@ __const float sub_z)
         z_F1 += V * z_dist;
     }
 
+#if ALLPAIRS
+    // inter-cell interactions, all-pairs reference: every cell is a candidate
+    for (k = 0; k < cell_no; ++k) {
+        if (k == cellId) continue; // same-cell handled by the intra loop
+        partner_force(gId, cellId, k, max_ele, x, y, z, xc, yc, zc,
+                      ele_per_cell, cell_type, &x_F1, &y_F1, &z_F1);
+    }
+#else
     // inter-cell interactions, sweeping the 27-bin neighborhood of cell centers
     int my_bx = (int)floor((xc[cellId] - bin_ox) / inter_dist);
     int my_by = (int)floor((yc[cellId] - bin_oy) / inter_dist);
@@ -199,39 +247,13 @@ __const float sub_z)
                 for (int p = start; p < end; ++p) {
                     k = cell_list[p];
                     if (k == cellId) continue; // same-cell handled by the intra loop
-
-                    // cell-cell cull: reject the whole 20x20 element block cheaply
-                    float dist = 20.0f;
-                    x_dist = fabs(xc[cellId] - xc[k]);
-                    if (x_dist > dist) continue;
-                    y_dist = fabs(yc[cellId] - yc[k]);
-                    if (y_dist > dist) continue;
-                    z_dist = fabs(zc[cellId] - zc[k]);
-                    if (distance3_new(x_dist, y_dist, z_dist) > dist) continue;
-
-                    for (j = 0; j < ele_per_cell[k]; ++j) {
-                        i = k * max_ele + j;
-                        x_dist = x[gId] - x[i];
-                        y_dist = y[gId] - y[i];
-                        z_dist = z[gId] - z[i];
-                        r = distance3_new(x_dist, y_dist, z_dist);
-                        if (r >= 12.0f) continue; // inter potentials are 0 past 12
-
-                        if (cell_type[cellId] == cell_type[k]) {
-                            V = inter_potential_same(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
-                        } else if ((cell_type[cellId] + cell_type[k]) == 3) {
-                            V = inter_potential_01(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
-                        } else {
-                            V = inter_potential(r, x[gId], y[gId], z[gId], &x_F1, &y_F1, &z_F1);
-                        }
-                        x_F1 += V * x_dist;
-                        y_F1 += V * y_dist;
-                        z_F1 += V * z_dist;
-                    }
+                    partner_force(gId, cellId, k, max_ele, x, y, z, xc, yc, zc,
+                                  ele_per_cell, cell_type, &x_F1, &y_F1, &z_F1);
                 }
             }
         }
     }
+#endif
 
     // external force, applied once per element, to the
     // substrate-anchored elements of slow-dividing cells
