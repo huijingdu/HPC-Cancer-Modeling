@@ -71,6 +71,9 @@
 #define MAX_ITERATIONS 1001
 #define MAX_CHEM_ITER  1000
 #define MAX_DEATH 60000
+#ifndef SEED
+#define SEED 42
+#endif
 
 #define C1_MEAN 180.0 // slow-dividing doubles in 180 days
 #define C1_STD 40.0 // standard deviation
@@ -878,7 +881,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
 
     // fixed seed so a run is reproducible, offset per rank so the bands do not
     // draw identical streams
-    srand(42 + g_rank);
+    srand(SEED + g_rank);
 
     for(int i = 0; i < max_ele_no; i++)
     {
