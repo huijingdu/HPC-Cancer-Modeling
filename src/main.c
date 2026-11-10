@@ -43,6 +43,12 @@
 #endif
 #endif
 
+// OpenCL device type each rank runs on
+// allows tuning during compile time
+#ifndef DEVICE_TYPE
+#define DEVICE_TYPE CL_DEVICE_TYPE_GPU
+#endif
+
 #define BIN_SIZE 12.0f
 #define g_dx_TARGET 1.0f
 #define PAD 5.0f
@@ -944,7 +950,7 @@ int runCL(float * x, float * y, float * z, int * id, int * cell_type, int * ele_
     cl_platform_id *plats = malloc(sizeof(cl_platform_id) * nplat);
     clGetPlatformIDs(nplat, plats, NULL);
 
-    const cl_device_type wanted = CL_DEVICE_TYPE_GPU; // The type of requested device
+    const cl_device_type wanted = DEVICE_TYPE; // The type of requested device
 
     // rank to GPU binding: prefer the launcher's node local rank so that two ranks
     // sharing a node land on different devices, and fall back to the global rank
